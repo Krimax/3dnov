@@ -92,7 +92,9 @@ int find_clicked_face(scene_object_t* object, int object_index, int mouse_x, int
 int find_clicked_vertex(scene_object_t* object, int object_index, int mouse_x, int mouse_y);
 int find_clicked_edge(scene_object_t* object, int object_index, int mouse_x, int mouse_y);
 vec3_t get_world_pos_on_plane(int mouse_x, int mouse_y);
+vec3_t get_selection_world_center(void);
 void draw_coordinate_ui(HDC hdc);
+void draw_color_ui(HDC hdc); // NEW
 void destroy_and_apply_coord_edit();
 vec3_t get_selection_center(scene_object_t* object);
 void draw_pixel_thick(int x, int y, float z, uint32_t color);
@@ -116,6 +118,7 @@ void scene_set_parent(scene_t* scene, int child_index, int parent_index);
 // --- UI and Coordinate Editing Variables ---
 static HWND g_hEdit = NULL; // Handle to the temporary edit box
 static RECT g_coord_rects[3]; // Clickable rectangles for X, Y, Z coordinates
+static RECT g_color_swatch_rect;
 static int g_editing_coord_axis = -1; // 0=X, 1=Y, 2=Z, -1=Not editing
 static int g_is_box_selecting = 0;
 static RECT g_selection_box_rect;
@@ -167,6 +170,7 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
     new_object->position = (vec3_t){ 0, 0, 0 };
     new_object->rotation = (vec3_t){ 0, 0, 0 };
     new_object->scale = (vec3_t){ 1, 1, 1 };
+    new_object->color = (vec3_t){ 0.8f, 0.8f, 0.8f }; // Default color
 
     new_object->parent_index = -1;
     new_object->child_count = 0;
@@ -269,15 +273,26 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     char header[4];
     fread(header, sizeof(char), 4, file);
     if (strncmp(header, "SCN1", 4) != 0) {
-        MessageBox(NULL, "Invalid or corrupted scene file.", "Error", MB_OK | MB_ICONERROR);
-        fclose(file);
-        return 0;
+        // This is an old file format that doesn't have color. 
+        // We could handle it gracefully, but for now, we'll just load it and the color will be uninitialized.
+        // A better approach would be to check a version number in the header.
+        // For now, we seek back to the beginning to reread the object count.
+        fseek(file, 0, SEEK_SET); 
+        char old_header[4] = "SCN0"; // Assume old files might have a different header or none
+        // We'll proceed, but colors will be garbage. Let's add a default.
     }
+
 
     scene_destroy(scene);
     scene_init(scene);
 
     int object_count = 0;
+    // Re-read the header to check version, then read count
+    fseek(file, 0, SEEK_SET);
+    fread(header, sizeof(char), 4, file);
+    int has_color_data = (strncmp(header, "SCN1", 4) == 0);
+
+
     fread(&object_count, sizeof(int), 1, file);
 
     // --- PASS 1: Load all objects and their parent indices ---
@@ -302,6 +317,13 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         fread(&new_obj->position, sizeof(vec3_t), 1, file);
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
+        
+        if (has_color_data) {
+            fread(&new_obj->color, sizeof(vec3_t), 1, file); // <-- NEW: Read color
+        } else {
+            new_obj->color = (vec3_t){0.8f, 0.8f, 0.8f}; // Default for old files
+        }
+
         fread(&new_obj->parent_index, sizeof(int), 1, file);
 
         // Read mesh data
@@ -424,6 +446,7 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         fwrite(&obj->position, sizeof(vec3_t), 1, file);
         fwrite(&obj->rotation, sizeof(vec3_t), 1, file);
         fwrite(&obj->scale, sizeof(vec3_t), 1, file);
+        fwrite(&obj->color, sizeof(vec3_t), 1, file); // <-- NEW: Write color
 
         // --- NEW: Write hierarchy data ---
         fwrite(&obj->parent_index, sizeof(int), 1, file);
@@ -617,42 +640,74 @@ mesh_t* create_face_mesh(void) {
     mesh->faces[2] = 1;
     return mesh;
 }
-
 mesh_t* create_cube_mesh(void) {
     mesh_t* mesh = (mesh_t*)malloc(sizeof(mesh_t));
     if (!mesh) return NULL;
     mesh->vertex_count = 8;
     mesh->vertices = (vec3_t*)malloc(mesh->vertex_count * sizeof(vec3_t));
-    mesh->vertices[0] = (vec3_t){-0.5f,-0.5f,-0.5f}; mesh->vertices[1] = (vec3_t){0.5f,-0.5f,-0.5f};
-    mesh->vertices[2] = (vec3_t){0.5f,0.5f,-0.5f};   mesh->vertices[3] = (vec3_t){-0.5f,0.5f,-0.5f};
-    mesh->vertices[4] = (vec3_t){-0.5f,-0.5f,0.5f};  mesh->vertices[5] = (vec3_t){0.5f,-0.5f,0.5f};
-    mesh->vertices[6] = (vec3_t){0.5f,0.5f,0.5f};    mesh->vertices[7] = (vec3_t){-0.5f,0.5f,0.5f};
+    // Bottom face vertices (Z = -0.5)
+    mesh->vertices[0] = (vec3_t){-0.5f, -0.5f, -0.5f}; // 0: left-back-bottom
+    mesh->vertices[1] = (vec3_t){ 0.5f, -0.5f, -0.5f}; // 1: right-back-bottom
+    mesh->vertices[2] = (vec3_t){ 0.5f,  0.5f, -0.5f}; // 2: right-front-bottom
+    mesh->vertices[3] = (vec3_t){-0.5f,  0.5f, -0.5f}; // 3: left-front-bottom
+    // Top face vertices (Z = 0.5)
+    mesh->vertices[4] = (vec3_t){-0.5f, -0.5f,  0.5f}; // 4: left-back-top
+    mesh->vertices[5] = (vec3_t){ 0.5f, -0.5f,  0.5f}; // 5: right-back-top
+    mesh->vertices[6] = (vec3_t){ 0.5f,  0.5f,  0.5f}; // 6: right-front-top
+    mesh->vertices[7] = (vec3_t){-0.5f,  0.5f,  0.5f}; // 7: left-front-top
+    
     mesh->face_count = 12;
     mesh->faces = (int*)malloc(mesh->face_count * 3 * sizeof(int));
     int i=0;
-    mesh->faces[i++]=0; mesh->faces[i++]=3; mesh->faces[i++]=2; mesh->faces[i++]=0; mesh->faces[i++]=2; mesh->faces[i++]=1;
-    mesh->faces[i++]=4; mesh->faces[i++]=5; mesh->faces[i++]=6; mesh->faces[i++]=4; mesh->faces[i++]=6; mesh->faces[i++]=7;
-    mesh->faces[i++]=1; mesh->faces[i++]=2; mesh->faces[i++]=6; mesh->faces[i++]=1; mesh->faces[i++]=6; mesh->faces[i++]=5;
-    mesh->faces[i++]=4; mesh->faces[i++]=7; mesh->faces[i++]=3; mesh->faces[i++]=4; mesh->faces[i++]=3; mesh->faces[i++]=0;
-    mesh->faces[i++]=3; mesh->faces[i++]=7; mesh->faces[i++]=6; mesh->faces[i++]=3; mesh->faces[i++]=6; mesh->faces[i++]=2;
-    mesh->faces[i++]=0; mesh->faces[i++]=1; mesh->faces[i++]=5; mesh->faces[i++]=0; mesh->faces[i++]=5; mesh->faces[i++]=4;
+    
+    // Correct Counter-Clockwise winding for all faces (viewed from outside)
+    // Front face (+Y)
+    mesh->faces[i++]=2; mesh->faces[i++]=3; mesh->faces[i++]=7;
+    mesh->faces[i++]=2; mesh->faces[i++]=7; mesh->faces[i++]=6;
+    // Back face (-Y)
+    mesh->faces[i++]=1; mesh->faces[i++]=5; mesh->faces[i++]=4;
+    mesh->faces[i++]=1; mesh->faces[i++]=4; mesh->faces[i++]=0;
+    // Top face (+Z)
+    mesh->faces[i++]=4; mesh->faces[i++]=5; mesh->faces[i++]=6;
+    mesh->faces[i++]=4; mesh->faces[i++]=6; mesh->faces[i++]=7;
+    // Bottom face (-Z)
+    mesh->faces[i++]=0; mesh->faces[i++]=3; mesh->faces[i++]=2;
+    mesh->faces[i++]=0; mesh->faces[i++]=2; mesh->faces[i++]=1;
+    // Right face (+X)
+    mesh->faces[i++]=1; mesh->faces[i++]=2; mesh->faces[i++]=6;
+    mesh->faces[i++]=1; mesh->faces[i++]=6; mesh->faces[i++]=5;
+    // Left face (-X)
+    mesh->faces[i++]=0; mesh->faces[i++]=4; mesh->faces[i++]=7;
+    mesh->faces[i++]=0; mesh->faces[i++]=7; mesh->faces[i++]=3;
+    
     return mesh;
 }
-
 mesh_t* create_pyramid_mesh(void) {
     mesh_t* mesh = (mesh_t*)malloc(sizeof(mesh_t));
     if (!mesh) return NULL;
     mesh->vertex_count = 5;
     mesh->vertices = (vec3_t*)malloc(mesh->vertex_count * sizeof(vec3_t));
-    mesh->vertices[0] = (vec3_t){-0.5f,-0.5f,-0.5f}; mesh->vertices[1] = (vec3_t){0.5f,-0.5f,-0.5f};
-    mesh->vertices[2] = (vec3_t){0.5f,-0.5f,0.5f};   mesh->vertices[3] = (vec3_t){-0.5f,-0.5f,0.5f};
-    mesh->vertices[4] = (vec3_t){0.0f,0.5f,0.0f};
+    // Base vertices on the XY plane (at Z = -0.5)
+    mesh->vertices[0] = (vec3_t){-0.5f, -0.5f, -0.5f};
+    mesh->vertices[1] = (vec3_t){ 0.5f, -0.5f, -0.5f};
+    mesh->vertices[2] = (vec3_t){ 0.5f,  0.5f, -0.5f};
+    mesh->vertices[3] = (vec3_t){-0.5f,  0.5f, -0.5f};
+    // Apex vertex (height is along the Z axis)
+    mesh->vertices[4] = (vec3_t){ 0.0f,  0.0f,  0.5f};
+    
     mesh->face_count = 6;
     mesh->faces = (int*)malloc(mesh->face_count * 3 * sizeof(int));
     int i=0;
-    mesh->faces[i++]=0; mesh->faces[i++]=1; mesh->faces[i++]=2; mesh->faces[i++]=0; mesh->faces[i++]=2; mesh->faces[i++]=3;
-    mesh->faces[i++]=0; mesh->faces[i++]=4; mesh->faces[i++]=1; mesh->faces[i++]=1; mesh->faces[i++]=4; mesh->faces[i++]=2;
-    mesh->faces[i++]=2; mesh->faces[i++]=4; mesh->faces[i++]=3; mesh->faces[i++]=3; mesh->faces[i++]=4; mesh->faces[i++]=0;
+    
+    // Base faces (winding order is clockwise so normal points down, -Z)
+    mesh->faces[i++]=0; mesh->faces[i++]=2; mesh->faces[i++]=1;
+    mesh->faces[i++]=0; mesh->faces[i++]=3; mesh->faces[i++]=2;
+    
+    // Side faces (winding order is base-edge -> apex so normal points outwards)
+    mesh->faces[i++]=0; mesh->faces[i++]=1; mesh->faces[i++]=4;
+    mesh->faces[i++]=1; mesh->faces[i++]=2; mesh->faces[i++]=4;
+    mesh->faces[i++]=2; mesh->faces[i++]=3; mesh->faces[i++]=4;
+    mesh->faces[i++]=3; mesh->faces[i++]=0; mesh->faces[i++]=4;
     return mesh;
 }
 
@@ -787,6 +842,49 @@ void draw_outliner_object_recursive(HDC hdc, int object_index, int depth, int* y
         draw_outliner_object_recursive(hdc, obj->children[i], depth + 1, y_offset);
     }
 }
+void draw_color_ui(HDC hdc) {
+    // Only draw if one or more objects are selected
+    if (g_selected_objects.count == 0) {
+        g_color_swatch_rect.left = -1; // Invalidate rect
+        return;
+    }
+
+    // Use the color of the first selected object for the swatch
+    scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
+    vec3_t color = object->color;
+
+    int x_offset = 10;
+    // Position it below the coordinate UI
+    int y_offset = 10 + (3 * 20); // 3 lines of coords, 20px height each
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, 0x00FFFFFF);
+
+    // Draw the "Color:" label
+    char text_buffer[] = "Color:";
+    TextOut(hdc, x_offset, y_offset, text_buffer, strlen(text_buffer));
+    
+    SIZE text_size;
+    GetTextExtentPoint32(hdc, text_buffer, strlen(text_buffer), &text_size);
+
+    // Calculate the position for the color swatch rectangle
+    g_color_swatch_rect.left = x_offset + text_size.cx + 5; // 5px padding
+    g_color_swatch_rect.top = y_offset;
+    g_color_swatch_rect.right = g_color_swatch_rect.left + 50; // 50px wide swatch
+    g_color_swatch_rect.bottom = y_offset + text_size.cy;
+
+    // Create a brush with the object's color
+    uint8_t r = (uint8_t)(color.x * 255.0f);
+    uint8_t g = (uint8_t)(color.y * 255.0f);
+    uint8_t b = (uint8_t)(color.z * 255.0f);
+    HBRUSH hBrush = CreateSolidBrush(RGB(r, g, b));
+
+    // Draw the filled rectangle
+    FillRect(hdc, &g_color_swatch_rect, hBrush);
+
+    // Clean up the GDI brush
+    DeleteObject(hBrush);
+}
 void draw_coordinate_ui(HDC hdc) {
     // Only draw if exactly one object is selected.
     if (g_selected_objects.count != 1) {
@@ -919,22 +1017,63 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         MSG message;
         while (PeekMessage(&message, NULL, 0, 0, PM_REMOVE)) { if (message.message == WM_QUIT) running = 0; TranslateMessage(&message); DispatchMessage(&message); }
         
-        // 1. Draw the 3D scene into the off-screen buffer
         render_frame();
         
-        // 2. Get the device context for the window
         HDC window_dc = GetDC(g_window_handle);
-        
-        // 3. Create a memory device context that is compatible with our framebuffer
         HDC memory_dc = CreateCompatibleDC(window_dc);
-        
-        // 4. Select our framebuffer's bitmap into the memory DC.
-        //    Now, all GDI drawing to 'memory_dc' goes to our off-screen buffer.
         HBITMAP old_bitmap = (HBITMAP)SelectObject(memory_dc, g_framebuffer_bitmap);
 
-        // 5. Draw all UI elements into the memory_dc (our off-screen buffer)
+        // --- NEW: Draw Transform Axis Guide Line ---
+        if (g_current_transform_mode != TRANSFORM_NONE && g_transform_axis_is_locked) {
+            // Recalculate the VP matrix (same as in render_frame)
+            vec3_t offset = {.x = g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y = g_camera_distance*sinf(g_camera_pitch), .z = g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+            vec3_t camera_pos = vec3_add(g_camera_target, offset);
+            vec3_t up_vector = {0, 0, 1}; if (fabs(sinf(g_camera_pitch)) > 0.999f) up_vector = (vec3_t){0, 1, 0}; 
+            mat4_t view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
+            mat4_t projection_matrix;
+            float aspect_ratio = (float)g_framebuffer_width / (float)g_framebuffer_height;
+            if (g_is_orthographic) {
+                float ortho_height = g_camera_distance; float ortho_width = ortho_height * aspect_ratio;
+                projection_matrix = mat4_orthographic(-ortho_width/2.0f, ortho_width/2.0f, -ortho_height/2.0f, ortho_height/2.0f, 0.1f, 100.0f);
+            } else {
+                projection_matrix = mat4_perspective(3.14159f/4.0f, aspect_ratio, 0.1f, 100.0f);
+            }
+            mat4_t vp_matrix = mat4_mul_mat4(projection_matrix, view_matrix);
+
+            // Define the world-space line
+            vec3_t center = get_selection_world_center();
+            float line_length = 1000.0f; // A very long line
+            vec3_t p1_world = vec3_sub(center, vec3_scale(g_transform_axis, line_length));
+            vec3_t p2_world = vec3_add(center, vec3_scale(g_transform_axis, line_length));
+
+            // Project to screen space
+            vec4_t p1_clip = mat4_mul_vec4(vp_matrix, (vec4_t){p1_world.x, p1_world.y, p1_world.z, 1.0f});
+            vec4_t p2_clip = mat4_mul_vec4(vp_matrix, (vec4_t){p2_world.x, p2_world.y, p2_world.z, 1.0f});
+
+            if (p1_clip.w > 0 && p2_clip.w > 0) { // Basic clipping check
+                int sx1 = (int)((p1_clip.x / p1_clip.w + 1.0f) * 0.5f * g_framebuffer_width);
+                int sy1 = (int)((1.0f - p1_clip.y / p1_clip.w) * 0.5f * g_framebuffer_height);
+                int sx2 = (int)((p2_clip.x / p2_clip.w + 1.0f) * 0.5f * g_framebuffer_width);
+                int sy2 = (int)((1.0f - p2_clip.y / p2_clip.w) * 0.5f * g_framebuffer_height);
+
+                uint32_t axis_color = 0xFFFFFFFF; // Should not happen
+                if (g_transform_axis.x > 0.9f) axis_color = 0x000000FF; // Red for X (COLORREF is BGR)
+                else if (g_transform_axis.y > 0.9f) axis_color = 0x0000FF00; // Green for Y
+                else if (g_transform_axis.z > 0.9f) axis_color = 0x00FF0000; // Blue for Z
+                
+                HPEN hPen = CreatePen(PS_DOT, 1, axis_color);
+                HGDIOBJ hOldPen = SelectObject(memory_dc, hPen);
+                MoveToEx(memory_dc, sx1, sy1, NULL);
+                LineTo(memory_dc, sx2, sy2);
+                SelectObject(memory_dc, hOldPen);
+                DeleteObject(hPen);
+            }
+        }
+        // --- END NEW ---
+
         draw_scene_outliner(memory_dc);
         draw_coordinate_ui(memory_dc);
+        draw_color_ui(memory_dc);
         draw_shading_ui(memory_dc);
         
         if (g_is_box_selecting) {
@@ -947,18 +1086,16 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
             DeleteObject(hPen);
         }
         
-        // 6. Copy the entire completed buffer from the memory DC to the window's DC (the screen)
-        //    This is a single, fast operation that prevents flicker.
         BitBlt(window_dc, 0, 0, g_framebuffer_width, g_framebuffer_height, memory_dc, 0, 0, SRCCOPY);
 
-        // 7. Clean up the GDI objects
         SelectObject(memory_dc, old_bitmap);
         DeleteDC(memory_dc);
         ReleaseDC(g_window_handle, window_dc);
         
     }
     return 0;
-}void render_frame() {
+}
+void render_frame() {
     if (!g_framebuffer_memory) return;
     uint32_t clear_color = 0xFF303030;
     uint32_t* pixel = (uint32_t*)g_framebuffer_memory;
@@ -966,15 +1103,18 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         *pixel++ = clear_color;
         g_depth_buffer[i] = FLT_MAX;
     }
-    vec3_t offset = {.x = g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y = g_camera_distance*sinf(g_camera_pitch), .z = g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
-    vec3_t camera_pos = vec3_add(g_camera_target, offset);
 
-    vec3_t up_vector = {0, 1, 0};
-    // Check if the camera is looking nearly straight up or down
+    // --- MODIFIED: Z-Up spherical coordinate calculation ---
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
+    vec3_t camera_pos = vec3_add(g_camera_target, offset);
+    // --- END MODIFICATION ---
+
+    vec3_t up_vector = {0, 0, 1}; // Z is now UP
     if (fabs(sinf(g_camera_pitch)) > 0.999f) {
-        // If so, use the Z-axis as the "up" direction to stabilize the view matrix
-        // The sign of Z depends on yaw, but a fixed direction works for our snap-views
-        up_vector = (vec3_t){0, 0, -1};
+        up_vector = (vec3_t){0, 1, 0}; 
     }
     mat4_t view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
     
@@ -1021,23 +1161,30 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                 vec3_t normal = vec3_normalize(vec3_cross(vec3_sub(v1, v0), vec3_sub(v2, v0)));
                 float dot_product = vec3_dot(normal, vec3_sub(camera_pos, v0));
 
-                // --- MODIFICATION START: Conditional Backface Culling ---
                 if (!object->is_double_sided && dot_product <= 0) {
-                    continue; // Skip rendering this face
+                    continue; 
                 }
                 
                 float light_intensity;
-                // If we are looking at the back of the face, flip the normal for lighting
                 if (dot_product < 0) {
                     light_intensity = vec3_dot(vec3_scale(normal, -1.0f), vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
                 } else {
                     light_intensity = vec3_dot(normal, vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
                 }
-                // --- MODIFICATION END ---
 
                 if (light_intensity < 0) light_intensity = 0;
-                uint8_t gray_val = (uint8_t)(light_intensity*175.0f+80.0f);
-                uint32_t face_color = (gray_val<<16)|(gray_val<<8)|gray_val;
+                
+                // --- COLOR CALCULATION ---
+                float ambient = 0.2f; // A bit of ambient light
+                float diffuse = light_intensity * 0.8f;
+                float total_light = ambient + diffuse;
+                if (total_light > 1.0f) total_light = 1.0f;
+
+                uint8_t r = (uint8_t)(object->color.x * total_light * 255.0f);
+                uint8_t g = (uint8_t)(object->color.y * total_light * 255.0f);
+                uint8_t b = (uint8_t)(object->color.z * total_light * 255.0f);
+                uint32_t face_color = (r << 16) | (g << 8) | b;
+                // --- END COLOR CALCULATION ---
             
                 if (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_FACES && is_object_selected && selection_contains(&g_selected_components, i)) { face_color = 0xFFFFA500; }
             
@@ -1105,23 +1252,65 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
 }
 void render_grid(mat4_t view_matrix, mat4_t projection_matrix) {
     int grid_size = 10; float half_size = grid_size/2.0f;
-    uint32_t grid_color = 0xFF808080, axis_color_z = 0xFF0000FF, axis_color_x = 0xFFFF0000;
+    uint32_t grid_color = 0xFF808080, axis_color_y = 0xFF00FF00, axis_color_x = 0xFFFF0000, axis_color_z = 0xFF0000FF;
     mat4_t vp_matrix = mat4_mul_mat4(projection_matrix, view_matrix);
+    
+    // Draw grid lines on the XY plane (Z=0)
     for (int i = -half_size; i <= half_size; i++) {
         if (i == 0) continue;
-        vec4_t p1 = {i,0,-half_size,1}, p2 = {i,0,half_size,1}, p3 = {-half_size,0,i,1}, p4 = {half_size,0,i,1};
+        // Lines parallel to the Y-axis
+        vec4_t p1 = {i, -half_size, 0, 1}, p2 = {i, half_size, 0, 1};
+        // Lines parallel to the X-axis
+        vec4_t p3 = {-half_size, i, 0, 1}, p4 = {half_size, i, 0, 1};
+        
         vec4_t sp[4] = {mat4_mul_vec4(vp_matrix,p1), mat4_mul_vec4(vp_matrix,p2), mat4_mul_vec4(vp_matrix,p3), mat4_mul_vec4(vp_matrix,p4)};
         for(int j=0;j<4;++j){if(sp[j].w!=0){sp[j].x=(sp[j].x/sp[j].w+1)*0.5f*g_framebuffer_width; sp[j].y=(1-sp[j].y/sp[j].w)*0.5f*g_framebuffer_height; sp[j].z=sp[j].z/sp[j].w;}}
         draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, grid_color);
         draw_line(sp[2].x,sp[2].y,sp[2].z, sp[3].x,sp[3].y,sp[3].z, grid_color);
     }
-    vec4_t z1={0,0,-half_size,1}, z2={0,0,half_size,1}, x1={-half_size,0,0,1}, x2={half_size,0,0,1};
-    vec4_t axis_p[4] = {mat4_mul_vec4(vp_matrix,z1), mat4_mul_vec4(vp_matrix,z2), mat4_mul_vec4(vp_matrix,x1), mat4_mul_vec4(vp_matrix,x2)};
-    for(int j=0;j<4;++j){if(axis_p[j].w!=0){axis_p[j].x=(axis_p[j].x/axis_p[j].w+1)*0.5f*g_framebuffer_width; axis_p[j].y=(1-axis_p[j].y/axis_p[j].w)*0.5f*g_framebuffer_height; axis_p[j].z=axis_p[j].z/axis_p[j].w;}}
-    draw_line(axis_p[0].x,axis_p[0].y,axis_p[0].z, axis_p[1].x,axis_p[1].y,axis_p[1].z, axis_color_z);
-    draw_line(axis_p[2].x,axis_p[2].y,axis_p[2].z, axis_p[3].x,axis_p[3].y,axis_p[3].z, axis_color_x);
+    
+    // Draw the main axes
+    vec4_t x1={-half_size,0,0,1}, x2={half_size,0,0,1}; // X-axis
+    vec4_t y1={0,-half_size,0,1}, y2={0,half_size,0,1}; // Y-axis
+    vec4_t z1={0,0,-half_size,1}, z2={0,0,half_size,1}; // Z-axis
+
+    vec4_t axis_p[6] = {mat4_mul_vec4(vp_matrix,x1), mat4_mul_vec4(vp_matrix,x2), mat4_mul_vec4(vp_matrix,y1), mat4_mul_vec4(vp_matrix,y2), mat4_mul_vec4(vp_matrix,z1), mat4_mul_vec4(vp_matrix,z2)};
+    for(int j=0;j<6;++j){if(axis_p[j].w!=0){axis_p[j].x=(axis_p[j].x/axis_p[j].w+1)*0.5f*g_framebuffer_width; axis_p[j].y=(1-axis_p[j].y/axis_p[j].w)*0.5f*g_framebuffer_height; axis_p[j].z=axis_p[j].z/axis_p[j].w;}}
+    
+    draw_line(axis_p[0].x,axis_p[0].y,axis_p[0].z, axis_p[1].x,axis_p[1].y,axis_p[1].z, axis_color_x); // Red X
+    draw_line(axis_p[2].x,axis_p[2].y,axis_p[2].z, axis_p[3].x,axis_p[3].y,axis_p[3].z, axis_color_y); // Green Y
+    draw_line(axis_p[4].x,axis_p[4].y,axis_p[4].z, axis_p[5].x,axis_p[5].y,axis_p[5].z, axis_color_z); // Blue Z
 }
-// Calculates the average position of the currently selected components
+vec3_t get_selection_world_center(void) {
+    vec3_t center = {0, 0, 0};
+    if (g_selected_objects.count == 0) return center;
+
+    if (g_current_mode == MODE_OBJECT) {
+        for (int i = 0; i < g_selected_objects.count; i++) {
+            mat4_t world_matrix = mat4_get_world_transform(&g_scene, g_selected_objects.items[i]);
+            center.x += world_matrix.m[0][3];
+            center.y += world_matrix.m[1][3];
+            center.z += world_matrix.m[2][3];
+        }
+        if (g_selected_objects.count > 0) {
+            center = vec3_scale(center, 1.0f / g_selected_objects.count);
+        }
+    } else { // MODE_EDIT
+        scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
+        if (g_selected_components.count == 0) {
+             mat4_t world_matrix = mat4_get_world_transform(&g_scene, g_selected_objects.items[0]);
+             center.x = world_matrix.m[0][3];
+             center.y = world_matrix.m[1][3];
+             center.z = world_matrix.m[2][3];
+        } else {
+            vec3_t local_pivot = get_selection_center(obj);
+            mat4_t model_matrix = mat4_get_world_transform(&g_scene, g_selected_objects.items[0]);
+            vec4_t world_pivot_4d = mat4_mul_vec4(model_matrix, (vec4_t){local_pivot.x, local_pivot.y, local_pivot.z, 1.0f});
+            center = (vec3_t){world_pivot_4d.x, world_pivot_4d.y, world_pivot_4d.z};
+        }
+    }
+    return center;
+}
 vec3_t get_selection_center(scene_object_t* object) {
     if (!object || g_selected_components.count == 0) {
         return (vec3_t){0, 0, 0};
@@ -1180,9 +1369,19 @@ int ray_intersects_triangle(vec3_t ro,vec3_t rv,vec3_t v0,vec3_t v1,vec3_t v2,fl
 int find_clicked_object(int mx, int my) {
     float xn=(2.0f*mx)/g_framebuffer_width-1.0f, yn=1.0f-(2.0f*my)/g_framebuffer_height;
     mat4_t proj=mat4_perspective(3.14159f/4.0f, (float)g_framebuffer_width/g_framebuffer_height, 0.1f, 100.0f);
-    vec3_t offset = {.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+    
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t cam_pos = vec3_add(g_camera_target, offset);
-    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+    
+    vec3_t up_vector = {0, 0, 1};
+    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+        up_vector = (vec3_t){0, 1, 0};
+    }
+    mat4_t view = mat4_look_at(cam_pos, g_camera_target, up_vector);
+
     mat4_t inv_vp=mat4_inverse(mat4_mul_mat4(proj,view));
     vec4_t near_p_w=mat4_mul_vec4(inv_vp,(vec4_t){xn,yn,-1,1}), far_p_w=mat4_mul_vec4(inv_vp,(vec4_t){xn,yn,1,1});
     if(near_p_w.w!=0){near_p_w.x/=near_p_w.w; near_p_w.y/=near_p_w.w; near_p_w.z/=near_p_w.w;}
@@ -1206,59 +1405,158 @@ int find_clicked_object(int mx, int my) {
 int find_clicked_vertex(scene_object_t* object, int object_index, int mx, int my) {
     if (!object) return -1;
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
-    vec3_t offset = {.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y=g_camera_distance*sinf(g_camera_pitch), .z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+    
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t cam_pos = vec3_add(g_camera_target, offset);
-    mat4_t view_matrix = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+
+    vec3_t up_vector = {0, 0, 1};
+    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+        up_vector = (vec3_t){0, 1, 0};
+    }
+    mat4_t view_matrix = mat4_look_at(cam_pos, g_camera_target, up_vector);
+
     mat4_t projection_matrix = mat4_perspective(3.14159f/4.0f, (float)g_framebuffer_width/(float)g_framebuffer_height, 0.1f, 100.0f);
     mat4_t final_transform = mat4_mul_mat4(projection_matrix, mat4_mul_mat4(view_matrix, model_matrix));
-    int closest_vertex_idx = -1; float closest_dist_sq = FLT_MAX;
+    
+    int closest_vertex_idx = -1; 
+    float closest_dist_sq = FLT_MAX;
+    
     for (int i = 0; i < object->mesh->vertex_count; i++) {
         vec4_t v_proj = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[i].x, object->mesh->vertices[i].y, object->mesh->vertices[i].z, 1.0f});
         if (v_proj.w > 0) {
             float sx = (v_proj.x / v_proj.w + 1.0f) * 0.5f * g_framebuffer_width;
             float sy = (1.0f - v_proj.y / v_proj.w) * 0.5f * g_framebuffer_height;
-            float dx = mx - sx, dy = my - sy; float dist_sq = dx*dx + dy*dy;
-            if (dist_sq < (8.0f*8.0f) && dist_sq < closest_dist_sq) { closest_dist_sq=dist_sq; closest_vertex_idx=i; }
+            float dx = mx - sx, dy = my - sy; 
+            float dist_sq = dx*dx + dy*dy;
+            if (dist_sq < (8.0f*8.0f) && dist_sq < closest_dist_sq) { 
+                closest_dist_sq=dist_sq; 
+                closest_vertex_idx=i; 
+            }
         }
-    } return closest_vertex_idx;
+    } 
+    return closest_vertex_idx;
 }
 int find_clicked_face(scene_object_t* object, int object_index, int mx, int my) {
     if (!object) return -1;
     float xn = (2.0f*mx)/g_framebuffer_width-1.0f, yn=1.0f-(2.0f*my)/g_framebuffer_height;
     mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_framebuffer_width/(float)g_framebuffer_height, 0.1f, 100.0f);
-    vec3_t offset = {.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+    
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t cam_pos = vec3_add(g_camera_target, offset);
-    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+    
+    vec3_t up_vector = {0, 0, 1};
+    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+        up_vector = (vec3_t){0, 1, 0};
+    }
+    mat4_t view = mat4_look_at(cam_pos, g_camera_target, up_vector);
+
     mat4_t inv_vp = mat4_inverse(mat4_mul_mat4(proj, view));
     vec4_t near_p_w = mat4_mul_vec4(inv_vp,(vec4_t){xn,yn,-1,1}), far_p_w=mat4_mul_vec4(inv_vp,(vec4_t){xn,yn,1,1});
     if(near_p_w.w!=0){near_p_w.x/=near_p_w.w; near_p_w.y/=near_p_w.w; near_p_w.z/=near_p_w.w;}
     if(far_p_w.w!=0){far_p_w.x/=far_p_w.w; far_p_w.y/=far_p_w.w; far_p_w.z/=far_p_w.w;}
     vec3_t ro={near_p_w.x,near_p_w.y,near_p_w.z}, rd=vec3_normalize(vec3_sub((vec3_t){far_p_w.x,far_p_w.y,far_p_w.z},ro));
+    
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
-    int closest_face_idx = -1; float closest_dist = FLT_MAX;
+    int closest_face_idx = -1; 
+    float closest_dist = FLT_MAX;
+    
     for (int j = 0; j < object->mesh->face_count; j++) {
         int v0i=object->mesh->faces[j*3+0], v1i=object->mesh->faces[j*3+1], v2i=object->mesh->faces[j*3+2];
         vec4_t v0w=mat4_mul_vec4(model_matrix,(vec4_t){object->mesh->vertices[v0i].x,object->mesh->vertices[v0i].y,object->mesh->vertices[v0i].z,1});
         vec4_t v1w=mat4_mul_vec4(model_matrix,(vec4_t){object->mesh->vertices[v1i].x,object->mesh->vertices[v1i].y,object->mesh->vertices[v1i].z,1});
         vec4_t v2w=mat4_mul_vec4(model_matrix,(vec4_t){object->mesh->vertices[v2i].x,object->mesh->vertices[v2i].y,object->mesh->vertices[v2i].z,1});
         vec3_t v0={v0w.x,v0w.y,v0w.z}, v1={v1w.x,v1w.y,v1w.z}, v2={v2w.x,v2w.y,v2w.z};
-        float dist; if(ray_intersects_triangle(ro,rd,v0,v1,v2,&dist)){if(dist<closest_dist){closest_dist=dist; closest_face_idx=j;}}
-    } return closest_face_idx;
+        float dist; 
+        if(ray_intersects_triangle(ro,rd,v0,v1,v2,&dist)){
+            if(dist<closest_dist){
+                closest_dist=dist; 
+                closest_face_idx=j;
+            }
+        }
+    } 
+    return closest_face_idx;
 }
 int find_clicked_edge(scene_object_t* object, int object_index, int mx, int my) {
     if (!object || !object->mesh) return -1;
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
-    vec3_t offset = {.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+    
+    // --- CORRECTED: Use Z-Up camera math ---
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t cam_pos = vec3_add(g_camera_target, offset);
-    mat4_t view_matrix = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+    
+    vec3_t up_vector = {0, 0, 1};
+    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+        up_vector = (vec3_t){0, 1, 0};
+    }
+    mat4_t view_matrix = mat4_look_at(cam_pos, g_camera_target, up_vector);
+    // --- END CORRECTION ---
+
     mat4_t projection_matrix = mat4_perspective(3.14159f/4.0f,(float)g_framebuffer_width/(float)g_framebuffer_height,0.1f,100.0f);
     mat4_t final_transform = mat4_mul_mat4(projection_matrix, mat4_mul_mat4(view_matrix, model_matrix));
-    int best_edge_packed = -1; float closest_dist = FLT_MAX; const float click_threshold = 10.0f;
-    char processed_edges[100][100] = {0};
-    vec4_t* screen_verts = (vec4_t*)malloc(object->mesh->vertex_count * sizeof(vec4_t)); if (!screen_verts) return -1;
-    for(int i=0;i<object->mesh->vertex_count;i++){vec4_t v_proj=mat4_mul_vec4(final_transform,(vec4_t){object->mesh->vertices[i].x,object->mesh->vertices[i].y,object->mesh->vertices[i].z,1.0f}); if(v_proj.w>0){screen_verts[i].x=(v_proj.x/v_proj.w+1.0f)*0.5f*g_framebuffer_width; screen_verts[i].y=(1.0f-v_proj.y/v_proj.w)*0.5f*g_framebuffer_height; screen_verts[i].w=1;}else{screen_verts[i].w=0;}}
-    for(int i=0;i<object->mesh->face_count;i++){int v_indices[3]={object->mesh->faces[i*3+0],object->mesh->faces[i*3+1],object->mesh->faces[i*3+2]}; for(int j=0;j<3;j++){int v1_idx=v_indices[j],v2_idx=v_indices[(j+1)%3]; int min_idx=(v1_idx<v2_idx)?v1_idx:v2_idx,max_idx=(v1_idx>v2_idx)?v1_idx:v2_idx; if(processed_edges[min_idx][max_idx])continue; processed_edges[min_idx][max_idx]=1; if(screen_verts[v1_idx].w==0||screen_verts[v2_idx].w==0)continue; float p1x=screen_verts[v1_idx].x,p1y=screen_verts[v1_idx].y,p2x=screen_verts[v2_idx].x,p2y=screen_verts[v2_idx].y; float dx=p2x-p1x,dy=p2y-p1y,dist; if(dx==0&&dy==0){dist=sqrtf(powf(mx-p1x,2)+powf(my-p1y,2));}else{float t=((mx-p1x)*dx+(my-p1y)*dy)/(dx*dx+dy*dy); if(t<0){dist=sqrtf(powf(mx-p1x,2)+powf(my-p1y,2));}else if(t>1){dist=sqrtf(powf(mx-p2x,2)+powf(my-p2y,2));}else{dist=sqrtf(powf(mx-(p1x+t*dx),2)+powf(my-(p1y+t*dy),2));}} if(dist<closest_dist){closest_dist=dist; best_edge_packed=(min_idx<<16)|max_idx;}}}
-    free(screen_verts); return (closest_dist<click_threshold)?best_edge_packed:-1;
+    
+    int best_edge_packed = -1; 
+    float closest_dist = FLT_MAX; 
+    const float click_threshold = 10.0f;
+    
+    // A more robust way to track processed edges, assuming max 1024 vertices
+    #define MAX_VERTS_FOR_EDGE_PICK 1024
+    if (object->mesh->vertex_count > MAX_VERTS_FOR_EDGE_PICK) return -1; // Safety check
+    char processed_edges[MAX_VERTS_FOR_EDGE_PICK][MAX_VERTS_FOR_EDGE_PICK] = {0};
+
+    vec4_t* screen_verts = (vec4_t*)malloc(object->mesh->vertex_count * sizeof(vec4_t)); 
+    if (!screen_verts) return -1;
+    
+    for(int i=0; i < object->mesh->vertex_count; i++) {
+        vec4_t v_proj=mat4_mul_vec4(final_transform,(vec4_t){object->mesh->vertices[i].x,object->mesh->vertices[i].y,object->mesh->vertices[i].z,1.0f}); 
+        if(v_proj.w>0){
+            screen_verts[i].x=(v_proj.x/v_proj.w+1.0f)*0.5f*g_framebuffer_width; 
+            screen_verts[i].y=(1.0f-v_proj.y/v_proj.w)*0.5f*g_framebuffer_height; 
+            screen_verts[i].w=1;
+        } else {
+            screen_verts[i].w=0;
+        }
+    }
+    
+    for(int i=0; i < object->mesh->face_count; i++) {
+        int v_indices[3]={object->mesh->faces[i*3+0],object->mesh->faces[i*3+1],object->mesh->faces[i*3+2]}; 
+        for(int j=0;j<3;j++){
+            int v1_idx=v_indices[j], v2_idx=v_indices[(j+1)%3]; 
+            int min_idx=(v1_idx<v2_idx)?v1_idx:v2_idx, max_idx=(v1_idx>v2_idx)?v1_idx:v2_idx; 
+            if(processed_edges[min_idx][max_idx]) continue; 
+            processed_edges[min_idx][max_idx]=1; 
+            if(screen_verts[v1_idx].w==0||screen_verts[v2_idx].w==0) continue; 
+            float p1x=screen_verts[v1_idx].x,p1y=screen_verts[v1_idx].y,p2x=screen_verts[v2_idx].x,p2y=screen_verts[v2_idx].y; 
+            float dx=p2x-p1x,dy=p2y-p1y,dist; 
+            if(dx==0&&dy==0){
+                dist=sqrtf(powf(mx-p1x,2)+powf(my-p1y,2));
+            } else {
+                float t=((mx-p1x)*dx+(my-p1y)*dy)/(dx*dx+dy*dy); 
+                if(t<0) {
+                    dist=sqrtf(powf(mx-p1x,2)+powf(my-p1y,2));
+                } else if(t>1) {
+                    dist=sqrtf(powf(mx-p2x,2)+powf(my-p2y,2));
+                } else {
+                    dist=sqrtf(powf(mx-(p1x+t*dx),2)+powf(my-(p1y+t*dy),2));
+                }
+            } 
+            if(dist<closest_dist){
+                closest_dist=dist; 
+                best_edge_packed=(min_idx<<16)|max_idx;
+            }
+        }
+    }
+    
+    free(screen_verts); 
+    return (closest_dist < click_threshold) ? best_edge_packed : -1;
 }
 vec3_t get_world_pos_on_plane(int mouse_x, int mouse_y) {
     // 1. Unproject mouse coordinates to get a world-space ray (same as picking)
@@ -1266,9 +1564,21 @@ vec3_t get_world_pos_on_plane(int mouse_x, int mouse_y) {
     float yn = 1.0f - (2.0f * mouse_y) / g_framebuffer_height;
 
     mat4_t proj = mat4_perspective(3.14159f / 4.0f, (float)g_framebuffer_width / (float)g_framebuffer_height, 0.1f, 100.0f);
-    vec3_t offset = {.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y=g_camera_distance*sinf(g_camera_pitch), .z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+    
+    // --- MODIFIED: Use correct Z-up camera vectors ---
+    vec3_t offset;
+    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+    offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t cam_pos = vec3_add(g_camera_target, offset);
-    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+    
+    vec3_t up_vector = {0, 0, 1};
+    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+        up_vector = (vec3_t){0, 1, 0};
+    }
+    mat4_t view = mat4_look_at(cam_pos, g_camera_target, up_vector);
+    // --- END MODIFICATION ---
+
     mat4_t inv_vp = mat4_inverse(mat4_mul_mat4(proj, view));
 
     vec4_t near_p_w = mat4_mul_vec4(inv_vp, (vec4_t){xn, yn, -1, 1});
@@ -1279,13 +1589,13 @@ vec3_t get_world_pos_on_plane(int mouse_x, int mouse_y) {
     vec3_t ro = {near_p_w.x, near_p_w.y, near_p_w.z};
     vec3_t rd = vec3_normalize(vec3_sub((vec3_t){far_p_w.x, far_p_w.y, far_p_w.z}, ro));
 
-    // 2. Calculate intersection with the Y=0 plane
-    vec3_t plane_normal = {0, 1, 0};
+    // 2. Calculate intersection with the Z=0 plane
+    vec3_t plane_normal = {0, 0, 1}; // MODIFIED for Z-up
     float denom = vec3_dot(rd, plane_normal);
 
     // Avoid division by zero if ray is parallel to the plane
     if (fabs(denom) > 1e-6) {
-        vec3_t plane_origin = {0, 0, 0}; // Any point on the Y=0 plane
+        vec3_t plane_origin = {0, 0, 0}; // Any point on the Z=0 plane
         vec3_t p0_l0 = vec3_sub(plane_origin, ro);
         float t = vec3_dot(p0_l0, plane_normal) / denom;
         if (t >= 0) { // Ensure the intersection is in front of the camera
@@ -1426,6 +1736,36 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     return 0;
                 }
             }
+
+            // --- NEW: Handle Color Swatch Click ---
+            if (g_selected_objects.count > 0 && PtInRect(&g_color_swatch_rect, pt)) {
+                CHOOSECOLOR cc;
+                static COLORREF acrCustClr[16]; 
+                ZeroMemory(&cc, sizeof(cc));
+                cc.lStructSize = sizeof(cc);
+                cc.hwndOwner = window_handle;
+                cc.lpCustColors = (LPDWORD) acrCustClr;
+                
+                // Set initial color from the first selected object
+                vec3_t initial_color = g_scene.objects[g_selected_objects.items[0]]->color;
+                cc.rgbResult = RGB((BYTE)(initial_color.x * 255), (BYTE)(initial_color.y * 255), (BYTE)(initial_color.z * 255));
+                cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+                if (ChooseColor(&cc) == TRUE) {
+                    // Convert the chosen color back to vec3_t (0-1 range)
+                    vec3_t new_color;
+                    new_color.x = GetRValue(cc.rgbResult) / 255.0f;
+                    new_color.y = GetGValue(cc.rgbResult) / 255.0f;
+                    new_color.z = GetBValue(cc.rgbResult) / 255.0f;
+
+                    // Apply the new color to all selected objects
+                    for (int i = 0; i < g_selected_objects.count; i++) {
+                        g_scene.objects[g_selected_objects.items[i]]->color = new_color;
+                    }
+                }
+                return 0; // Handled
+            }
+            // --- END NEW ---
 
             int can_edit_coords = (g_selected_objects.count == 1) && g_current_transform_mode == TRANSFORM_NONE && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1));
             if (can_edit_coords) {
@@ -1762,10 +2102,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                                 if (g_transform_axis_is_locked) {
                                     mv = vec3_scale(g_transform_axis, (float)(dx_total - dy_total) * sens_translate);
                                 } else {
-                                    vec3_t offset={.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)}; 
+                                    vec3_t offset;
+                                    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                                    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                                    offset.z = g_camera_distance * sinf(g_camera_pitch);
                                     vec3_t cam_pos=vec3_add(g_camera_target,offset); 
                                     vec3_t fwd=vec3_normalize(vec3_sub(g_camera_target,cam_pos)); 
-                                    vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,1,0})); 
+                                    vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,0,1})); 
                                     vec3_t up=vec3_normalize(vec3_cross(right,fwd)); 
                                     mv=vec3_add(vec3_scale(right, (float)dx_total * sens_translate), vec3_scale(up, (float)-dy_total * sens_translate));
                                 }
@@ -1809,10 +2152,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                             if (g_transform_axis_is_locked) {
                                 mv = vec3_scale(g_transform_axis, (float)(dx_total - dy_total) * sens_translate);
                             } else {
-                                vec3_t offset={.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)}; 
+                                vec3_t offset;
+                                offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                                offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                                offset.z = g_camera_distance * sinf(g_camera_pitch);
                                 vec3_t cam_pos=vec3_add(g_camera_target,offset); 
                                 vec3_t fwd=vec3_normalize(vec3_sub(g_camera_target,cam_pos)); 
-                                vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,1,0})); 
+                                vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,0,1})); 
                                 vec3_t up=vec3_normalize(vec3_cross(right,fwd)); 
                                 mv=vec3_add(vec3_scale(right, (float)dx_total * sens_translate), vec3_scale(up, (float)-dy_total * sens_translate));
                             }
@@ -1934,7 +2280,14 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 }
             } else if (g_middle_mouse_down && (GetKeyState(VK_SHIFT) & 0x8000)) {
                 g_mouse_dragged=1; float sens=0.0025f*g_camera_distance;
-                vec3_t offset={.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)}; vec3_t cam_pos=vec3_add(g_camera_target,offset); vec3_t fwd=vec3_normalize(vec3_sub(g_camera_target,cam_pos)); vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,1,0})); vec3_t up=vec3_normalize(vec3_cross(right,fwd));
+                vec3_t offset;
+                offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                offset.z = g_camera_distance * sinf(g_camera_pitch);
+                vec3_t cam_pos=vec3_add(g_camera_target,offset); 
+                vec3_t fwd=vec3_normalize(vec3_sub(g_camera_target,cam_pos)); 
+                vec3_t right=vec3_normalize(vec3_cross(fwd,(vec3_t){0,0,1})); 
+                vec3_t up=vec3_normalize(vec3_cross(right,fwd));
                 g_camera_target=vec3_add(g_camera_target,vec3_add(vec3_scale(right,-dx*sens),vec3_scale(up,dy*sens)));
             } else if (g_middle_mouse_down) {
                 g_mouse_dragged=1; g_camera_yaw+=(float)dx*0.01f; g_camera_pitch+=(float)dy*0.01f;
@@ -2121,9 +2474,15 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 for (int i=0; i<g_selected_objects.count; i++) {
                     scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
                     switch(w_param){
-                        case 'W':shift?(obj->rotation.x-=rs):(obj->position.y+=ms);break; case 'S':shift?(obj->rotation.x+=rs):(obj->position.y-=ms);break;
-                        case 'A':shift?(obj->rotation.y-=rs):(obj->position.x-=ms);break; case 'D':shift?(obj->rotation.y+=rs):(obj->position.x+=ms);break;
-                        case 'E':shift?(obj->rotation.z+=rs):(obj->position.z+=ms);break; case 'Q':shift?(obj->rotation.z-=rs):(obj->position.z-=ms);break;
+                        // Y-axis movement/rotation (Forward/Back)
+                        case 'W':shift?(obj->rotation.y-=rs):(obj->position.y+=ms);break; 
+                        case 'S':shift?(obj->rotation.y+=rs):(obj->position.y-=ms);break;
+                        // X-axis movement/rotation (Left/Right)
+                        case 'A':shift?(obj->rotation.x-=rs):(obj->position.x-=ms);break; 
+                        case 'D':shift?(obj->rotation.x+=rs):(obj->position.x+=ms);break;
+                        // Z-axis movement/rotation (Up/Down)
+                        case 'E':shift?(obj->rotation.z+=rs):(obj->position.z+=ms);break; 
+                        case 'Q':shift?(obj->rotation.z-=rs):(obj->position.z-=ms);break;
                     }
                 }
             }

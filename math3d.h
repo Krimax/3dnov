@@ -18,6 +18,7 @@ typedef struct {
     vec3_t position;    // Object's position in the world
     vec3_t rotation;    // Euler angles for rotation (in radians)
     vec3_t scale;       // Scale along each axis
+    vec3_t color;       // NEW: Object's diffuse color
     
     // --- HIERARCHY FIELDS ---
     int parent_index;   // Index of the parent object in the scene's objects array (-1 for none)
