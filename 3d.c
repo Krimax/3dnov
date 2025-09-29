@@ -1,4 +1,4 @@
-//gcc 3d.c math3d.c -o editor.exe -lgdi32 -luser32 -lcomdlg32
+//gcc 3d.c math3d.c -o editor.exe -lgdi32 -luser32 -lcomdlg32 -lmsimg32
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
@@ -105,6 +105,7 @@ void destroy_mesh_data(mesh_t* mesh);
 void draw_scene_outliner(HDC hdc);
 void draw_outliner_object_recursive(HDC hdc, int object_index, int depth, int* y_offset);
 void mesh_add_face(mesh_t* mesh, int v1, int v2, int v3);
+void mesh_delete_face(mesh_t* mesh, int face_index_to_delete);
 int mesh_add_vertex(mesh_t* mesh, vec3_t vertex);
 void selection_init(selection_t* s);
 void selection_remove(selection_t* s, int item_to_remove);
@@ -145,6 +146,74 @@ void scene_init(scene_t* scene) {
     scene->capacity = 10;
     scene->object_count = 0;
     scene->objects = (scene_object_t**)malloc(scene->capacity * sizeof(scene_object_t*));
+}
+int scene_duplicate_object(scene_t* scene, int source_index) {
+    if (!scene || source_index < 0 || source_index >= scene->object_count) {
+        return -1;
+    }
+
+    scene_object_t* source_obj = scene->objects[source_index];
+
+    // Ensure we have capacity for the new object
+    if (scene->object_count >= scene->capacity) {
+        scene->capacity *= 2;
+        scene->objects = (scene_object_t**)realloc(scene->objects, scene->capacity * sizeof(scene_object_t*));
+    }
+
+    // Create and allocate the new object
+    scene_object_t* new_object = (scene_object_t*)malloc(sizeof(scene_object_t));
+    if (!new_object) return -1;
+
+    // --- Deep copy all properties from the source ---
+    new_object->mesh = mesh_copy(source_obj->mesh);
+    if (!new_object->mesh) {
+        free(new_object);
+        return -1;
+    }
+    
+    new_object->position = source_obj->position;
+    new_object->rotation = source_obj->rotation;
+    new_object->scale = source_obj->scale;
+    new_object->color = source_obj->color;
+    new_object->is_double_sided = source_obj->is_double_sided;
+    
+    // Duplicated objects should not start with a parent.
+    // The user can re-parent them manually if desired.
+    new_object->parent_index = -1;
+    new_object->child_count = 0;
+    new_object->child_capacity = 4; // Start with a fresh children array
+    new_object->children = (int*)malloc(new_object->child_capacity * sizeof(int));
+
+    // Generate a new unique name
+    // Find the base name (e.g., "Cube" from "Cube.001")
+    char base_name[64];
+    strcpy_s(base_name, sizeof(base_name), source_obj->name);
+    char* dot = strrchr(base_name, '.');
+    if (dot && strspn(dot + 1, "0123456789") == strlen(dot + 1)) {
+        *dot = '\0'; // Cut off the numeric extension
+    }
+    
+    // Find the highest existing number for this base name to avoid collisions
+    int max_num = 0;
+    for (int i = 0; i < scene->object_count; i++) {
+        if (strncmp(scene->objects[i]->name, base_name, strlen(base_name)) == 0) {
+            const char* num_part = strrchr(scene->objects[i]->name, '.');
+            if (num_part) {
+                int num = atoi(num_part + 1);
+                if (num > max_num) {
+                    max_num = num;
+                }
+            }
+        }
+    }
+    sprintf_s(new_object->name, sizeof(new_object->name), "%s.%03d", base_name, max_num + 1);
+
+    // Add the new object to the scene
+    int new_index = scene->object_count;
+    scene->objects[new_index] = new_object;
+    scene->object_count++;
+
+    return new_index;
 }
 void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
     static int cube_count = 1;
@@ -270,32 +339,26 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         return 0;
     }
 
+    // --- REVISED: More robust version checking ---
     char header[4];
     fread(header, sizeof(char), 4, file);
-    if (strncmp(header, "SCN1", 4) != 0) {
-        // This is an old file format that doesn't have color. 
-        // We could handle it gracefully, but for now, we'll just load it and the color will be uninitialized.
-        // A better approach would be to check a version number in the header.
-        // For now, we seek back to the beginning to reread the object count.
-        fseek(file, 0, SEEK_SET); 
-        char old_header[4] = "SCN0"; // Assume old files might have a different header or none
-        // We'll proceed, but colors will be garbage. Let's add a default.
-    }
+    int is_new_format = (strncmp(header, "SCN1", 4) == 0);
 
+    int object_count = 0;
+    if (is_new_format) {
+        // New SCN1 format: Header is followed by the object count.
+        fread(&object_count, sizeof(int), 1, file);
+    } else {
+        // Old format: The first 4 bytes *were* the object count.
+        fseek(file, 0, SEEK_SET);
+        fread(&object_count, sizeof(int), 1, file);
+    }
+    // --- END REVISED ---
 
     scene_destroy(scene);
     scene_init(scene);
 
-    int object_count = 0;
-    // Re-read the header to check version, then read count
-    fseek(file, 0, SEEK_SET);
-    fread(header, sizeof(char), 4, file);
-    int has_color_data = (strncmp(header, "SCN1", 4) == 0);
-
-
-    fread(&object_count, sizeof(int), 1, file);
-
-    // --- PASS 1: Load all objects and their parent indices ---
+    // --- PASS 1: Load all objects ---
     for (int i = 0; i < object_count; i++) {
         if (scene->object_count >= scene->capacity) {
             scene->capacity *= 2;
@@ -308,23 +371,24 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
         if (!new_obj->mesh) { free(new_obj); continue; }
 
-        // Initialize children array
         new_obj->child_count = 0;
         new_obj->child_capacity = 4;
         new_obj->children = (int*)malloc(new_obj->child_capacity * sizeof(int));
         
-        // Read transform and parent index
         fread(&new_obj->position, sizeof(vec3_t), 1, file);
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
         
-        if (has_color_data) {
-            fread(&new_obj->color, sizeof(vec3_t), 1, file); // <-- NEW: Read color
+        if (is_new_format) {
+            fread(&new_obj->color, sizeof(vec3_t), 1, file);
+            fread(&new_obj->parent_index, sizeof(int), 1, file);
+            fread(&new_obj->is_double_sided, sizeof(int), 1, file); // <-- MODIFIED: Read property
         } else {
-            new_obj->color = (vec3_t){0.8f, 0.8f, 0.8f}; // Default for old files
+            // Set defaults for old files
+            new_obj->color = (vec3_t){0.8f, 0.8f, 0.8f};
+            new_obj->parent_index = -1;
+            new_obj->is_double_sided = 0;
         }
-
-        fread(&new_obj->parent_index, sizeof(int), 1, file);
 
         // Read mesh data
         fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
@@ -343,12 +407,10 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         int parent_idx = scene->objects[i]->parent_index;
         if (parent_idx != -1) {
             scene_object_t* parent_obj = scene->objects[parent_idx];
-            // Expand children array if needed
             if (parent_obj->child_count >= parent_obj->child_capacity) {
                 parent_obj->child_capacity *= 2;
                 parent_obj->children = (int*)realloc(parent_obj->children, parent_obj->child_capacity * sizeof(int));
             }
-            // Add this object's index to its parent's children list
             parent_obj->children[parent_obj->child_count++] = i;
         }
     }
@@ -446,11 +508,11 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         fwrite(&obj->position, sizeof(vec3_t), 1, file);
         fwrite(&obj->rotation, sizeof(vec3_t), 1, file);
         fwrite(&obj->scale, sizeof(vec3_t), 1, file);
-        fwrite(&obj->color, sizeof(vec3_t), 1, file); // <-- NEW: Write color
+        fwrite(&obj->color, sizeof(vec3_t), 1, file);
 
-        // --- NEW: Write hierarchy data ---
+        // Write hierarchy and property data
         fwrite(&obj->parent_index, sizeof(int), 1, file);
-        // --- END NEW ---
+        fwrite(&obj->is_double_sided, sizeof(int), 1, file); // <-- NEW: Write property
 
         // Write mesh data
         fwrite(&obj->mesh->vertex_count, sizeof(int), 1, file);
@@ -580,6 +642,27 @@ mesh_t* mesh_copy(const mesh_t* src) {
     }
 
     return dst;
+}
+void mesh_delete_face(mesh_t* mesh, int face_index_to_delete) {
+    if (!mesh || face_index_to_delete < 0 || face_index_to_delete >= mesh->face_count) {
+        return;
+    }
+
+    // To remove the face, we shift all subsequent faces down by one
+    // The face data is 3 integers (v1, v2, v3)
+    int start_of_deleted = face_index_to_delete * 3;
+    int start_of_next = (face_index_to_delete + 1) * 3;
+    int num_ints_to_move = (mesh->face_count - 1 - face_index_to_delete) * 3;
+
+    if (num_ints_to_move > 0) {
+        // Use memmove because the memory regions might overlap
+        memmove(&mesh->faces[start_of_deleted], &mesh->faces[start_of_next], num_ints_to_move * sizeof(int));
+    }
+
+    mesh->face_count--;
+
+    // Optionally, reallocate to a smaller memory block to save space,
+    // but for simplicity, we can skip this for now. It's a minor optimization.
 }
 void mesh_add_face(mesh_t* mesh, int v1, int v2, int v3) {
     if (!mesh) return;
@@ -986,6 +1069,13 @@ void trigger_save_scene_dialog(void) {
     if (GetSaveFileName(&ofn) == TRUE) {
         scene_save_to_file(&g_scene, ofn.lpstrFile);
     }
+}
+int compare_ints_desc(const void* a, const void* b) {
+    int int_a = *((int*)a);
+    int int_b = *((int*)b);
+    if (int_a < int_b) return 1;
+    if (int_a > int_b) return -1;
+    return 0;
 }
 // --- Main Entry Point ---
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, int cmd_show) {
@@ -1737,7 +1827,6 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 }
             }
 
-            // --- NEW: Handle Color Swatch Click ---
             if (g_selected_objects.count > 0 && PtInRect(&g_color_swatch_rect, pt)) {
                 CHOOSECOLOR cc;
                 static COLORREF acrCustClr[16]; 
@@ -1746,26 +1835,22 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 cc.hwndOwner = window_handle;
                 cc.lpCustColors = (LPDWORD) acrCustClr;
                 
-                // Set initial color from the first selected object
                 vec3_t initial_color = g_scene.objects[g_selected_objects.items[0]]->color;
                 cc.rgbResult = RGB((BYTE)(initial_color.x * 255), (BYTE)(initial_color.y * 255), (BYTE)(initial_color.z * 255));
                 cc.Flags = CC_FULLOPEN | CC_RGBINIT;
 
                 if (ChooseColor(&cc) == TRUE) {
-                    // Convert the chosen color back to vec3_t (0-1 range)
                     vec3_t new_color;
                     new_color.x = GetRValue(cc.rgbResult) / 255.0f;
                     new_color.y = GetGValue(cc.rgbResult) / 255.0f;
                     new_color.z = GetBValue(cc.rgbResult) / 255.0f;
 
-                    // Apply the new color to all selected objects
                     for (int i = 0; i < g_selected_objects.count; i++) {
                         g_scene.objects[g_selected_objects.items[i]]->color = new_color;
                     }
                 }
-                return 0; // Handled
+                return 0;
             }
-            // --- END NEW ---
 
             int can_edit_coords = (g_selected_objects.count == 1) && g_current_transform_mode == TRANSFORM_NONE && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1));
             if (can_edit_coords) {
@@ -2208,7 +2293,6 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                             if(!processed_verts) break;
 
                             for (int i = 0; i < g_selected_components.count; i++) {
-                                // Logic to get vertex indices is duplicated here to apply transform
                                 int comp_idx = g_selected_components.items[i];
                                 if (g_edit_mode_component==EDIT_VERTICES){
                                     if(!processed_verts[comp_idx]){
@@ -2326,6 +2410,66 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     } break;
                 }
                 return 0;
+            }
+            
+            // --- NEW: Delete Component Logic ---
+            if (w_param == 'X') {
+                if (g_current_mode == MODE_EDIT && g_selected_objects.count > 0 && g_selected_components.count > 0) {
+                    scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
+                    mesh_t* mesh = object->mesh;
+
+                    if (g_edit_mode_component == EDIT_FACES) {
+                        // Sort indices in descending order to avoid messing them up as we delete
+                        qsort(g_selected_components.items, g_selected_components.count, sizeof(int), compare_ints_desc);
+
+                        for (int i = 0; i < g_selected_components.count; i++) {
+                            mesh_delete_face(mesh, g_selected_components.items[i]);
+                        }
+                        selection_clear(&g_selected_components);
+                    }
+                    // We will add logic for vertices and edges later
+                    return 0; // Handled
+                }
+            }
+            // --- END NEW ---
+
+            if (w_param == 'D' && (GetKeyState(VK_SHIFT) & 0x8000)) {
+                if (g_current_mode == MODE_OBJECT && g_selected_objects.count > 0 && g_current_transform_mode == TRANSFORM_NONE) {
+                    selection_t new_selection;
+                    selection_init(&new_selection);
+
+                    for (int i = 0; i < g_selected_objects.count; i++) {
+                        int source_idx = g_selected_objects.items[i];
+                        int new_idx = scene_duplicate_object(&g_scene, source_idx);
+                        if (new_idx != -1) {
+                            selection_add(&new_selection, new_idx);
+                        }
+                    }
+
+                    if (new_selection.count > 0) {
+                        selection_destroy(&g_selected_objects);
+                        g_selected_objects = new_selection;
+
+                        g_current_transform_mode = TRANSFORM_GRAB;
+                        g_transform_axis_is_locked = 0;
+                        g_transform_axis = (vec3_t){0,0,0};
+                        GetCursorPos(&g_transform_start_mouse_pos);
+                        ScreenToClient(window_handle, &g_transform_start_mouse_pos);
+                        
+                        scene_object_t* first_new_obj = g_scene.objects[g_selected_objects.items[0]];
+                        g_transform_initial_position = first_new_obj->position;
+                        g_transform_initial_rotation = first_new_obj->rotation;
+                        g_transform_initial_scale    = first_new_obj->scale;
+                        
+                        if(g_transform_initial_vertices) {
+                            free(g_transform_initial_vertices);
+                            g_transform_initial_vertices = NULL;
+                        }
+                    } else {
+                        selection_destroy(&new_selection);
+                    }
+                    return 0;
+                }
             }
 
             switch(w_param) {
@@ -2474,13 +2618,10 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 for (int i=0; i<g_selected_objects.count; i++) {
                     scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
                     switch(w_param){
-                        // Y-axis movement/rotation (Forward/Back)
                         case 'W':shift?(obj->rotation.y-=rs):(obj->position.y+=ms);break; 
                         case 'S':shift?(obj->rotation.y+=rs):(obj->position.y-=ms);break;
-                        // X-axis movement/rotation (Left/Right)
                         case 'A':shift?(obj->rotation.x-=rs):(obj->position.x-=ms);break; 
                         case 'D':shift?(obj->rotation.x+=rs):(obj->position.x+=ms);break;
-                        // Z-axis movement/rotation (Up/Down)
                         case 'E':shift?(obj->rotation.z+=rs):(obj->position.z+=ms);break; 
                         case 'Q':shift?(obj->rotation.z-=rs):(obj->position.z-=ms);break;
                     }
