@@ -30,6 +30,7 @@ typedef struct {
     char name[64];      // Name for the object, to be displayed in the UI
     RECT ui_outliner_rect; // The clickable screen-space rect for this object in the outliner
     int is_double_sided; // 0 = Backface Culling (Default), 1 = Render both sides
+    int is_static;      // NEW: 0 = Dynamic (Default), 1 = Cannot be transformed in Scene Mode
 } scene_object_t;
 
 typedef struct {

@@ -120,7 +120,8 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
         fread(&new_obj->color, sizeof(vec3_t), 1, file);
         fread(&new_obj->parent_index, sizeof(int), 1, file);
-        fread(&new_obj->is_double_sided, sizeof(int), 1, file); // <-- MODIFIED: Read property
+        fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+        fread(&new_obj->is_static, sizeof(int), 1, file); // <-- MODIFIED: Read property
 
         // Read mesh data
         fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);

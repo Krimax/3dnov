@@ -53,7 +53,10 @@ static mesh_t* g_face_mesh_data = NULL;
 typedef enum { MODE_OBJECT, MODE_EDIT } operating_mode_t;
 typedef enum { EDIT_FACES, EDIT_VERTICES, EDIT_EDGES } edit_component_mode_t;
 typedef enum { SHADING_SOLID, SHADING_WIREFRAME } shading_mode_t;
-
+// --- NEW: Editor Mode ---
+typedef enum { EDITOR_MODEL, EDITOR_SCENE } editor_mode_t;
+static editor_mode_t g_current_editor_mode = EDITOR_SCENE; // Default to Scene mode
+static RECT g_mode_rects[2];
 
 // --- Transform Mode State Variables ---
 typedef enum {
@@ -94,7 +97,7 @@ int find_clicked_edge(scene_object_t* object, int object_index, int mouse_x, int
 vec3_t get_world_pos_on_plane(int mouse_x, int mouse_y);
 vec3_t get_selection_world_center(void);
 void draw_coordinate_ui(HDC hdc);
-void draw_color_ui(HDC hdc); // NEW
+void draw_color_ui(HDC hdc);
 void destroy_and_apply_coord_edit();
 vec3_t get_selection_center(scene_object_t* object);
 void draw_pixel_thick(int x, int y, float z, uint32_t color);
@@ -103,6 +106,7 @@ void normalize_rect(RECT* r);
 mesh_t* mesh_copy(const mesh_t* src);
 void destroy_mesh_data(mesh_t* mesh);
 void draw_scene_outliner(HDC hdc);
+void draw_mode_ui(HDC hdc);
 void draw_outliner_object_recursive(HDC hdc, int object_index, int depth, int* y_offset);
 void mesh_add_face(mesh_t* mesh, int v1, int v2, int v3);
 void mesh_delete_face(mesh_t* mesh, int face_index_to_delete);
@@ -116,6 +120,12 @@ void selection_destroy(selection_t* s);
 void trigger_save_scene_dialog(void);
 void trigger_load_scene_dialog(void);
 void scene_set_parent(scene_t* scene, int child_index, int parent_index);
+void model_save_to_file(scene_object_t* object, const char* filename);
+void model_load_from_file(scene_t* scene, const char* filename, vec3_t position);
+void trigger_save_model_dialog(void);
+void trigger_load_model_dialog(void);
+void scene_destroy(scene_t* scene);
+void scene_clear(scene_t* scene);
 // --- UI and Coordinate Editing Variables ---
 static HWND g_hEdit = NULL; // Handle to the temporary edit box
 static RECT g_coord_rects[3]; // Clickable rectangles for X, Y, Z coordinates
@@ -135,17 +145,22 @@ static RECT g_shading_rects[2];
 #define ID_ADD_FACE 1007
 #define ID_SAVE_SCENE 1008
 #define ID_LOAD_SCENE 1009
-    
 #define ID_PARENT_OBJECT 1010
 #define ID_UNPARENT_OBJECT 1011
-    
 #define ID_TOGGLE_DOUBLE_SIDED 1012
-  
+ #define ID_SAVE_MODEL 1013
+#define ID_LOAD_MODEL 1014
+#define ID_CLEAR_SCENE 1015
+#define ID_TOGGLE_STATIC 1016
 // --- Scene Management ---
 void scene_init(scene_t* scene) {
     scene->capacity = 10;
     scene->object_count = 0;
     scene->objects = (scene_object_t**)malloc(scene->capacity * sizeof(scene_object_t*));
+}
+void scene_clear(scene_t* scene) {
+    scene_destroy(scene);
+    scene_init(scene);
 }
 int scene_duplicate_object(scene_t* scene, int source_index) {
     if (!scene || source_index < 0 || source_index >= scene->object_count) {
@@ -215,7 +230,7 @@ int scene_duplicate_object(scene_t* scene, int source_index) {
 
     return new_index;
 }
-void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
+void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
     static int cube_count = 1;
     static int pyramid_count = 1;
     static int vertex_count = 1;
@@ -236,7 +251,11 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
         return;
     }
     
-    new_object->position = (vec3_t){ 0, 0, 0 };
+    if (g_current_editor_mode == EDITOR_MODEL) {
+        new_object->position = (vec3_t){ 0, 0, 0 };
+    } else {
+        new_object->position = pos;
+    }
     new_object->rotation = (vec3_t){ 0, 0, 0 };
     new_object->scale = (vec3_t){ 1, 1, 1 };
     new_object->color = (vec3_t){ 0.8f, 0.8f, 0.8f }; // Default color
@@ -246,6 +265,7 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
     new_object->child_capacity = 4;
     new_object->children = (int*)malloc(new_object->child_capacity * sizeof(int));
     new_object->is_double_sided = 0; // Default to backface culling ON
+    new_object->is_static = 0;       // NEW: Default to not static
 
     if (mesh_data_source == g_cube_mesh_data) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Cube.%03d", cube_count++);
@@ -257,7 +277,7 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Edge.%03d", edge_count++);
     } else if (mesh_data_source == g_face_mesh_data) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Face.%03d", face_count++);
-        new_object->is_double_sided = 1; // --- NEW: Faces should be double-sided by default
+        new_object->is_double_sided = 1;
     } else {
         sprintf_s(new_object->name, sizeof(new_object->name), "Object.%03d", generic_count++);
     }
@@ -382,12 +402,14 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         if (is_new_format) {
             fread(&new_obj->color, sizeof(vec3_t), 1, file);
             fread(&new_obj->parent_index, sizeof(int), 1, file);
-            fread(&new_obj->is_double_sided, sizeof(int), 1, file); // <-- MODIFIED: Read property
+            fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+            fread(&new_obj->is_static, sizeof(int), 1, file); // <-- MODIFIED: Read property
         } else {
             // Set defaults for old files
             new_obj->color = (vec3_t){0.8f, 0.8f, 0.8f};
             new_obj->parent_index = -1;
             new_obj->is_double_sided = 0;
+            new_obj->is_static = 0; // Default old files to dynamic
         }
 
         // Read mesh data
@@ -486,6 +508,114 @@ void scene_set_parent(scene_t* scene, int child_index, int parent_index) {
     child_obj->position.y = new_child_local_transform.m[1][3];
     child_obj->position.z = new_child_local_transform.m[2][3];
 }
+void model_save_to_file(scene_object_t* object, const char* filename) {
+    if (!object || !object->mesh || !filename) return;
+
+    FILE* file = fopen(filename, "wb");
+    if (!file) {
+        MessageBox(NULL, "Failed to open file for writing.", "Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Write a simple header: magic number "MDL1"
+    char header[4] = "MDL1";
+    fwrite(header, sizeof(char), 4, file);
+
+    mesh_t* mesh = object->mesh;
+
+    // Write mesh data
+    fwrite(&mesh->vertex_count, sizeof(int), 1, file);
+    if (mesh->vertex_count > 0) {
+        fwrite(mesh->vertices, sizeof(vec3_t), mesh->vertex_count, file);
+    }
+
+    fwrite(&mesh->face_count, sizeof(int), 1, file);
+    if (mesh->face_count > 0) {
+        fwrite(mesh->faces, sizeof(int), mesh->face_count * 3, file);
+    }
+
+    fclose(file);
+}
+void model_load_from_file(scene_t* scene, const char* filename, vec3_t position) {
+    if (!scene || !filename) return;
+
+    if (g_current_editor_mode == EDITOR_MODEL && scene->object_count > 0) {
+        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        MessageBox(NULL, "Failed to open model file for reading.", "Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Check header
+    char header[4];
+    fread(header, sizeof(char), 4, file);
+    if (strncmp(header, "MDL1", 4) != 0) {
+        MessageBox(NULL, "Invalid model file format.", "Error", MB_OK | MB_ICONERROR);
+        fclose(file);
+        return;
+    }
+
+    mesh_t* new_mesh = (mesh_t*)malloc(sizeof(mesh_t));
+    if (!new_mesh) {
+        fclose(file);
+        return;
+    }
+
+    // Read vertex data
+    fread(&new_mesh->vertex_count, sizeof(int), 1, file);
+    if (new_mesh->vertex_count > 0) {
+        new_mesh->vertices = (vec3_t*)malloc(new_mesh->vertex_count * sizeof(vec3_t));
+        fread(new_mesh->vertices, sizeof(vec3_t), new_mesh->vertex_count, file);
+    } else {
+        new_mesh->vertices = NULL;
+    }
+
+    // Read face data
+    fread(&new_mesh->face_count, sizeof(int), 1, file);
+    if (new_mesh->face_count > 0) {
+        new_mesh->faces = (int*)malloc(new_mesh->face_count * 3 * sizeof(int));
+        fread(new_mesh->faces, sizeof(int), new_mesh->face_count * 3, file);
+    } else {
+        new_mesh->faces = NULL;
+    }
+
+    fclose(file);
+
+    // Now, add this mesh as a new object to the scene, passing the position
+    scene_add_object(scene, new_mesh, position);
+
+    // scene_add_object creates a copy, so we must free the temporary mesh we loaded into
+    destroy_mesh_data(new_mesh);
+}
+void trigger_load_model_dialog(void) {
+    OPENFILENAME ofn = {0};
+    char szFile[260] = {0};
+
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_window_handle;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Model Files\0*.model\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileName(&ofn) == TRUE) {
+        // We need the world position from where the user right-clicked
+        // to place the new object.
+        POINT client_pos = g_last_right_click_pos;
+        ScreenToClient(g_window_handle, &client_pos);
+        vec3_t world_pos = get_world_pos_on_plane(client_pos.x, client_pos.y);
+
+        model_load_from_file(&g_scene, ofn.lpstrFile, world_pos);
+    }
+}
 void scene_save_to_file(scene_t* scene, const char* filename) {
     if (!scene || !filename) return;
 
@@ -512,7 +642,8 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
 
         // Write hierarchy and property data
         fwrite(&obj->parent_index, sizeof(int), 1, file);
-        fwrite(&obj->is_double_sided, sizeof(int), 1, file); // <-- NEW: Write property
+        fwrite(&obj->is_double_sided, sizeof(int), 1, file);
+        fwrite(&obj->is_static, sizeof(int), 1, file); // <-- NEW: Write static property
 
         // Write mesh data
         fwrite(&obj->mesh->vertex_count, sizeof(int), 1, file);
@@ -831,6 +962,39 @@ void destroy_and_apply_coord_edit() {
     g_hEdit = NULL;
     g_editing_coord_axis = -1;
 }
+void draw_mode_ui(HDC hdc) {
+    SetBkMode(hdc, TRANSPARENT);
+
+    // Position the buttons at the top-center of the window
+    const char* labels[] = {"Scene Mode", "Model Mode"};
+    SIZE text_sizes[2];
+    GetTextExtentPoint32(hdc, labels[0], strlen(labels[0]), &text_sizes[0]);
+    GetTextExtentPoint32(hdc, labels[1], strlen(labels[1]), &text_sizes[1]);
+
+    int total_width = text_sizes[0].cx + text_sizes[1].cx + 20; // 20px padding
+    int x_offset = (g_framebuffer_width - total_width) / 2;
+    int y_offset = 10;
+
+    for (int i = 0; i < 2; i++) {
+        // Highlight the selected button
+        if (i == g_current_editor_mode) {
+            SetTextColor(hdc, 0x00FFA500); // Orange for selected
+        } else {
+            SetTextColor(hdc, 0x00FFFFFF); // White for unselected
+        }
+
+        TextOut(hdc, x_offset, y_offset, labels[i], strlen(labels[i]));
+
+        // Store the clickable rectangle for this button
+        g_mode_rects[i].left = x_offset;
+        g_mode_rects[i].top = y_offset;
+        g_mode_rects[i].right = x_offset + text_sizes[i].cx;
+        g_mode_rects[i].bottom = y_offset + text_sizes[i].cy;
+
+        // Move the x_offset for the next button
+        x_offset += text_sizes[i].cx + 20; // Add padding
+    }
+}
 void draw_shading_ui(HDC hdc) {
     SetBkMode(hdc, TRANSPARENT);
 
@@ -863,6 +1027,10 @@ void draw_shading_ui(HDC hdc) {
     }
 }
 void draw_scene_outliner(HDC hdc) {
+    if (g_current_editor_mode != EDITOR_SCENE) {
+        return; // Don't draw the outliner in Model Mode
+    }
+
     // --- Draw the background panel ---
     // Create a brush for the semi-transparent background
     HBRUSH hBrush = CreateSolidBrush(0x00404040); // Dark gray
@@ -907,13 +1075,19 @@ void draw_outliner_object_recursive(HDC hdc, int object_index, int depth, int* y
         SetTextColor(hdc, 0x00FFFFFF); // White for unselected
     }
 
-    const char* name = obj->name;
-    int name_len = strlen(name);
-    TextOut(hdc, x_offset, *y_offset, name, name_len);
+    char display_name[128];
+    if (g_current_editor_mode == EDITOR_SCENE && obj->is_static) {
+        sprintf_s(display_name, sizeof(display_name), "%s [S]", obj->name);
+    } else {
+        strcpy_s(display_name, sizeof(display_name), obj->name);
+    }
+    
+    int name_len = strlen(display_name);
+    TextOut(hdc, x_offset, *y_offset, display_name, name_len);
 
     // Calculate and store the clickable rectangle for this outliner item
     SIZE text_size;
-    GetTextExtentPoint32(hdc, name, name_len, &text_size);
+    GetTextExtentPoint32(hdc, display_name, name_len, &text_size);
     obj->ui_outliner_rect.left = x_offset;
     obj->ui_outliner_rect.top = *y_offset;
     obj->ui_outliner_rect.right = x_offset + text_size.cx;
@@ -1049,6 +1223,33 @@ void trigger_load_scene_dialog(void) {
         }
     }
 }
+void trigger_save_model_dialog(void) {
+    if (g_selected_objects.count != 1) {
+        MessageBox(g_window_handle, "Please select exactly one object to save as a model.", "Save Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OPENFILENAME ofn = {0};
+    char szFile[260] = {0}; // buffer for file name
+
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_window_handle;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Model Files\0*.model\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "model";
+
+    // Display the Save As dialog box.
+    if (GetSaveFileName(&ofn) == TRUE) {
+        int selected_object_index = g_selected_objects.items[0];
+        model_save_to_file(g_scene.objects[selected_object_index], ofn.lpstrFile);
+    }
+}
 void trigger_save_scene_dialog(void) {
     OPENFILENAME ofn = {0};
     char szFile[260] = {0}; // buffer for file name
@@ -1097,10 +1298,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     g_vertex_mesh_data = create_vertex_mesh();
     g_edge_mesh_data = create_edge_mesh();
     g_face_mesh_data = create_face_mesh();
-    scene_add_object(&g_scene, g_cube_mesh_data);
-    if (g_scene.object_count > 0) g_scene.objects[0]->position.x = -1.0f;
-    scene_add_object(&g_scene, g_pyramid_mesh_data);
-    if (g_scene.object_count > 1) g_scene.objects[1]->position.x = 1.0f;
+    
+    // Pass initial positions directly to the function
+    scene_add_object(&g_scene, g_cube_mesh_data, (vec3_t){-1.0f, 0.0f, 0.0f});
+    scene_add_object(&g_scene, g_pyramid_mesh_data, (vec3_t){1.0f, 0.0f, 0.0f});
 
     int running = 1;
     while (running) {
@@ -1165,6 +1366,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         draw_coordinate_ui(memory_dc);
         draw_color_ui(memory_dc);
         draw_shading_ui(memory_dc);
+        draw_mode_ui(memory_dc);
         
         if (g_is_box_selecting) {
             HPEN hPen = CreatePen(PS_DOT, 1, 0x00FFFFFF);
@@ -1295,7 +1497,12 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             const float depth_offset = 0.002f;
             for (int j = 0; j < 3; j++) { sp[j].z -= depth_offset; }
             
-            uint32_t wire_color = (g_current_mode==MODE_OBJECT)?(is_object_selected?0xFFFF00:0xFFFFFF):(is_object_selected?0xFFFF00:0xFF808080);
+            uint32_t wire_color;
+            if (g_current_editor_mode == EDITOR_SCENE && object->is_static) {
+                wire_color = 0xFF606060; // Dark gray for static objects
+            } else {
+                 wire_color = (g_current_mode==MODE_OBJECT)?(is_object_selected?0xFFFF00:0xFFFFFF):(is_object_selected?0xFFFF00:0xFF808080);
+            }
             
             int v_indices[3] = {v0_idx, v1_idx, v2_idx};
             if (g_current_mode==MODE_EDIT && g_edit_mode_component==EDIT_EDGES && is_object_selected) {
@@ -1821,6 +2028,25 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             POINT pt = {mouse_x, mouse_y};
             
             for (int i = 0; i < 2; i++) {
+                if (PtInRect(&g_mode_rects[i], pt)) {
+                    editor_mode_t new_mode = (editor_mode_t)i;
+                    if (g_current_editor_mode != new_mode) {
+                         g_current_editor_mode = new_mode;
+                         selection_clear(&g_selected_objects);
+                         selection_clear(&g_selected_components);
+                         g_current_mode = MODE_OBJECT;
+                         
+                         if (g_current_editor_mode == EDITOR_MODEL) {
+                             scene_clear(&g_scene);
+                             scene_add_object(&g_scene, g_cube_mesh_data, (vec3_t){0, 0, 0});
+                             g_camera_target = (vec3_t){0, 0, 0};
+                         }
+                    }
+                    return 0;
+                }
+            }
+
+            for (int i = 0; i < 2; i++) {
                 if (PtInRect(&g_shading_rects[i], pt)) {
                     g_shading_mode = (shading_mode_t)i;
                     return 0;
@@ -2041,9 +2267,17 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             HMENU hMenu = CreatePopupMenu();
             HMENU hSubMenu = CreatePopupMenu();
 
-            AppendMenu(hMenu, MF_STRING, ID_LOAD_SCENE, "Load Scene");
-            AppendMenu(hMenu, MF_STRING, ID_SAVE_SCENE, "Save Scene");
-            AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+            if (g_current_editor_mode == EDITOR_SCENE) {
+                AppendMenu(hMenu, MF_STRING, ID_LOAD_SCENE, "Load Scene");
+                AppendMenu(hMenu, MF_STRING, ID_SAVE_SCENE, "Save Scene");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+            } else { // EDITOR_MODEL
+                AppendMenu(hMenu, MF_STRING, ID_LOAD_MODEL, "Load Model");
+                AppendMenu(hMenu, MF_STRING, ID_SAVE_MODEL, "Save Model");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenu(hMenu, MF_STRING, ID_CLEAR_SCENE, "New Model");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+            }
             
             AppendMenu(hSubMenu, MF_STRING, ID_ADD_CUBE, "Cube");
             AppendMenu(hSubMenu, MF_STRING, ID_ADD_PYRAMID, "Pyramid");
@@ -2057,25 +2291,33 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_DELETE_OBJECT, "Delete");
                 
-                int is_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
-                AppendMenu(hMenu, MF_STRING | (is_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
-            }
-            
-            if (g_selected_objects.count > 1) {
-                AppendMenu(hMenu, MF_STRING, ID_PARENT_OBJECT, "Parent");
-            }
-            
-            int can_unparent = 0;
-            if (g_selected_objects.count > 0) {
-                for (int i = 0; i < g_selected_objects.count; i++) {
-                    if (g_scene.objects[g_selected_objects.items[i]]->parent_index != -1) {
-                        can_unparent = 1;
-                        break;
-                    }
+                int is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
+                AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
+
+                if (g_current_editor_mode == EDITOR_SCENE) {
+                    int is_static_checked = g_scene.objects[g_selected_objects.items[0]]->is_static;
+                    AppendMenu(hMenu, MF_STRING | (is_static_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_STATIC, "Static");
                 }
             }
-            if (can_unparent) {
-                AppendMenu(hMenu, MF_STRING, ID_UNPARENT_OBJECT, "Unparent");
+            
+            // Only show parenting options in Scene Mode
+            if (g_current_editor_mode == EDITOR_SCENE) {
+                if (g_selected_objects.count > 1) {
+                    AppendMenu(hMenu, MF_STRING, ID_PARENT_OBJECT, "Parent");
+                }
+                
+                int can_unparent = 0;
+                if (g_selected_objects.count > 0) {
+                    for (int i = 0; i < g_selected_objects.count; i++) {
+                        if (g_scene.objects[g_selected_objects.items[i]]->parent_index != -1) {
+                            can_unparent = 1;
+                            break;
+                        }
+                    }
+                }
+                if (can_unparent) {
+                    AppendMenu(hMenu, MF_STRING, ID_UNPARENT_OBJECT, "Unparent");
+                }
             }
 
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, g_last_right_click_pos.x, g_last_right_click_pos.y, 0, window_handle, NULL);
@@ -2097,6 +2339,17 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 case ID_SAVE_SCENE:
                     trigger_save_scene_dialog();
                     break;
+                case ID_LOAD_MODEL:
+                    trigger_load_model_dialog();
+                    break;
+                case ID_SAVE_MODEL:
+                    trigger_save_model_dialog();
+                    break;
+                case ID_CLEAR_SCENE:
+                    scene_clear(&g_scene);
+                    selection_clear(&g_selected_objects);
+                    selection_clear(&g_selected_components);
+                    break;
                 case ID_DELETE_OBJECT:
                     if (g_selected_objects.count > 0) {
                         for(int i=0; i<g_selected_objects.count; ++i) {
@@ -2116,24 +2369,39 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     }
                     break;
                 case ID_ADD_CUBE:
-                    scene_add_object(&g_scene, g_cube_mesh_data);
-                    if (g_scene.object_count > 0) g_scene.objects[g_scene.object_count - 1]->position = new_pos;
+                    if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
+                        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    scene_add_object(&g_scene, g_cube_mesh_data, new_pos);
                     break;
                 case ID_ADD_PYRAMID:
-                    scene_add_object(&g_scene, g_pyramid_mesh_data);
-                    if (g_scene.object_count > 0) g_scene.objects[g_scene.object_count - 1]->position = new_pos;
+                    if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
+                        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    scene_add_object(&g_scene, g_pyramid_mesh_data, new_pos);
                     break;
                 case ID_ADD_FACE:
-                    scene_add_object(&g_scene, g_face_mesh_data);
-                    if (g_scene.object_count > 0) g_scene.objects[g_scene.object_count - 1]->position = new_pos;
+                    if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
+                        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    scene_add_object(&g_scene, g_face_mesh_data, new_pos);
                     break;
                 case ID_ADD_EDGE:
-                    scene_add_object(&g_scene, g_edge_mesh_data);
-                    if (g_scene.object_count > 0) g_scene.objects[g_scene.object_count - 1]->position = new_pos;
+                    if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
+                        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    scene_add_object(&g_scene, g_edge_mesh_data, new_pos);
                     break;
                 case ID_ADD_VERTEX:
-                    scene_add_object(&g_scene, g_vertex_mesh_data);
-                    if (g_scene.object_count > 0) g_scene.objects[g_scene.object_count - 1]->position = new_pos;
+                    if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
+                        MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    scene_add_object(&g_scene, g_vertex_mesh_data, new_pos);
                     break;
                 case ID_PARENT_OBJECT:
                     if (g_current_mode == MODE_OBJECT && g_selected_objects.count > 1) {
@@ -2156,6 +2424,14 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                         int new_state = !g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
                         for (int i = 0; i < g_selected_objects.count; i++) {
                             g_scene.objects[g_selected_objects.items[i]]->is_double_sided = new_state;
+                        }
+                    }
+                    break;
+                case ID_TOGGLE_STATIC:
+                    if (g_selected_objects.count > 0) {
+                        int new_state = !g_scene.objects[g_selected_objects.items[0]]->is_static;
+                        for (int i = 0; i < g_selected_objects.count; i++) {
+                            g_scene.objects[g_selected_objects.items[i]]->is_static = new_state;
                         }
                     }
                     break;
@@ -2503,6 +2779,16 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             
             if (w_param == 'G' || w_param == 'R' || w_param == 'S') {
                 int can_transform = (g_selected_objects.count > 0) && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_selected_components.count > 0));
+                
+                if (can_transform && g_current_editor_mode == EDITOR_SCENE && g_current_mode == MODE_OBJECT) {
+                    for (int i = 0; i < g_selected_objects.count; i++) {
+                        if (g_scene.objects[g_selected_objects.items[i]]->is_static) {
+                            can_transform = 0; // Found a static object, block transform
+                            break;
+                        }
+                    }
+                }
+
                 if (can_transform) {
                     if (w_param == 'G') g_current_transform_mode = TRANSFORM_GRAB;
                     else if (w_param == 'R') g_current_transform_mode = TRANSFORM_ROTATE;
@@ -2617,6 +2903,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 float ms=0.1f, rs=0.1f; int shift=GetKeyState(VK_SHIFT)&0x8000;
                 for (int i=0; i<g_selected_objects.count; i++) {
                     scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
+                    if (g_current_editor_mode == EDITOR_SCENE && obj->is_static) continue;
                     switch(w_param){
                         case 'W':shift?(obj->rotation.y-=rs):(obj->position.y+=ms);break; 
                         case 'S':shift?(obj->rotation.y+=rs):(obj->position.y-=ms);break;
