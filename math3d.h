@@ -7,6 +7,20 @@
 typedef struct { float x, y, z; } vec3_t;
 typedef struct { float x, y, z, w; } vec4_t;
 typedef struct { float m[4][4]; } mat4_t;
+typedef enum {
+    LIGHT_TYPE_POINT,
+    LIGHT_TYPE_SPOT
+} light_type_t;
+
+typedef struct {
+    light_type_t type;
+    vec3_t color;
+    float intensity;
+
+    // Spot light specific
+    float spot_angle; // The full angle of the cone in radians
+    float spot_blend; // 0 = hard edge, 1 = smooth falloff to the edge
+} light_t;
 typedef struct {
     vec3_t* vertices;   // Dynamic array of vertices
     int* faces;         // Dynamic array of face indices (3 per triangle)
@@ -19,7 +33,8 @@ typedef struct {
     vec3_t rotation;    // Euler angles for rotation (in radians)
     vec3_t scale;       // Scale along each axis
     vec3_t color;       // NEW: Object's diffuse color
-    
+    light_t* light_properties; // NEW: If not NULL, this object is a light source
+
     // --- HIERARCHY FIELDS ---
     int parent_index;   // Index of the parent object in the scene's objects array (-1 for none)
     int* children;      // Dynamic array of indices for child objects

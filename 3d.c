@@ -63,7 +63,8 @@ typedef enum {
     TRANSFORM_NONE,
     TRANSFORM_GRAB,
     TRANSFORM_ROTATE,
-    TRANSFORM_SCALE
+    TRANSFORM_SCALE,
+    TRANSFORM_LIGHT_INTENSITY
 } transform_mode_t;
 
 static transform_mode_t g_current_transform_mode = TRANSFORM_NONE;
@@ -75,6 +76,7 @@ static POINT g_transform_start_mouse_pos;      // Mouse position when transform 
 static vec3_t g_transform_initial_position;
 static vec3_t g_transform_initial_rotation;
 static vec3_t g_transform_initial_scale;
+static float g_transform_initial_intensity;
 static vec3_t* g_transform_initial_vertices = NULL;
 
 static operating_mode_t g_current_mode = MODE_OBJECT;
@@ -148,10 +150,13 @@ static RECT g_shading_rects[2];
 #define ID_PARENT_OBJECT 1010
 #define ID_UNPARENT_OBJECT 1011
 #define ID_TOGGLE_DOUBLE_SIDED 1012
- #define ID_SAVE_MODEL 1013
+#define ID_SAVE_MODEL 1013
 #define ID_LOAD_MODEL 1014
 #define ID_CLEAR_SCENE 1015
 #define ID_TOGGLE_STATIC 1016
+#define ID_ADD_POINT_LIGHT 1017
+#define ID_ADD_SPOT_LIGHT 1018
+
 // --- Scene Management ---
 void scene_init(scene_t* scene) {
     scene->capacity = 10;
@@ -229,6 +234,52 @@ int scene_duplicate_object(scene_t* scene, int source_index) {
     scene->object_count++;
 
     return new_index;
+}
+void scene_add_light(scene_t* scene, light_type_t type, vec3_t pos) {
+    static int point_light_count = 1;
+    static int spot_light_count = 1;
+
+    if (scene->object_count >= scene->capacity) {
+        scene->capacity *= 2;
+        scene->objects = (scene_object_t**)realloc(scene->objects, scene->capacity * sizeof(scene_object_t*));
+    }
+    scene_object_t* new_light_object = (scene_object_t*)malloc(sizeof(scene_object_t));
+    if (!new_light_object) return;
+
+    // --- Core Light Object Setup ---
+    new_light_object->mesh = NULL; // Lights don't have a mesh
+    new_light_object->light_properties = (light_t*)malloc(sizeof(light_t));
+    if (!new_light_object->light_properties) {
+        free(new_light_object);
+        return;
+    }
+    new_light_object->light_properties->type = type;
+    new_light_object->light_properties->color = (vec3_t){ 1.0f, 1.0f, 1.0f }; // Default white light
+    new_light_object->light_properties->intensity = 10.0f;
+
+    // --- Standard Object Properties ---
+    new_light_object->position = pos;
+    new_light_object->rotation = (vec3_t){ 0, 0, 0 };
+    new_light_object->scale = (vec3_t){ 1, 1, 1 };
+    new_light_object->color = (vec3_t){ 1.0f, 1.0f, 0.0f }; // Gizmo/Outliner color (Yellow)
+
+    new_light_object->parent_index = -1;
+    new_light_object->child_count = 0;
+    new_light_object->child_capacity = 4;
+    new_light_object->children = (int*)malloc(new_light_object->child_capacity * sizeof(int));
+    new_light_object->is_double_sided = 0;
+    new_light_object->is_static = 0;
+
+    if (type == LIGHT_TYPE_POINT) {
+        sprintf_s(new_light_object->name, sizeof(new_light_object->name), "PointLight.%03d", point_light_count++);
+    } else if (type == LIGHT_TYPE_SPOT) {
+        sprintf_s(new_light_object->name, sizeof(new_light_object->name), "SpotLight.%03d", spot_light_count++);
+        // Set default spot light properties
+        new_light_object->light_properties->spot_angle = 3.14159f / 4.0f; // 45 degrees
+        new_light_object->light_properties->spot_blend = 0.15f;
+    }
+
+    scene->objects[scene->object_count++] = new_light_object;
 }
 void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
     static int cube_count = 1;
@@ -309,6 +360,9 @@ void scene_remove_object(scene_t* scene, int index_to_remove) {
 
     // Free the object's own memory
     destroy_mesh_data(obj_to_remove->mesh);
+    if (obj_to_remove->light_properties) {
+        free(obj_to_remove->light_properties); // <-- NEW: Free light properties
+    }
     free(obj_to_remove->children);
     free(obj_to_remove);
 
@@ -341,6 +395,9 @@ void scene_destroy(scene_t* scene) {
     for (int i = 0; i < scene->object_count; i++) {
         if (scene->objects[i]) {
             destroy_mesh_data(scene->objects[i]->mesh);
+            if (scene->objects[i]->light_properties) {
+                free(scene->objects[i]->light_properties); // <-- NEW: Free light properties
+            }
             free(scene->objects[i]->children); // <-- ADD THIS LINE
             free(scene->objects[i]);
         }
@@ -1314,7 +1371,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         HDC memory_dc = CreateCompatibleDC(window_dc);
         HBITMAP old_bitmap = (HBITMAP)SelectObject(memory_dc, g_framebuffer_bitmap);
 
-        // --- NEW: Draw Transform Axis Guide Line ---
         if (g_current_transform_mode != TRANSFORM_NONE && g_transform_axis_is_locked) {
             // Recalculate the VP matrix (same as in render_frame)
             vec3_t offset = {.x = g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y = g_camera_distance*sinf(g_camera_pitch), .z = g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
@@ -1360,7 +1416,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
                 DeleteObject(hPen);
             }
         }
-        // --- END NEW ---
 
         draw_scene_outliner(memory_dc);
         draw_coordinate_ui(memory_dc);
@@ -1431,6 +1486,72 @@ void render_frame() {
     }
 }
 void render_object(scene_object_t* object, int object_index, mat4_t view_matrix, mat4_t projection_matrix, vec3_t camera_pos) {
+    // --- MODIFIED: Light Gizmo Rendering ---
+    if (object->light_properties) {
+        mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
+        mat4_t vp_matrix = mat4_mul_mat4(projection_matrix, view_matrix);
+        vec3_t pos = { model_matrix.m[0][3], model_matrix.m[1][3], model_matrix.m[2][3] };
+        uint32_t gizmo_color = (selection_contains(&g_selected_objects, object_index)) ? 0xFFFFA500 : 0xFFFFFF00;
+
+        // Draw the standard 'star' gizmo for all lights
+        float gizmo_size = 0.25f;
+        vec3_t points[6] = {
+            vec3_add(pos, (vec3_t){-gizmo_size, 0, 0}), vec3_add(pos, (vec3_t){gizmo_size, 0, 0}),
+            vec3_add(pos, (vec3_t){0, -gizmo_size, 0}), vec3_add(pos, (vec3_t){0, gizmo_size, 0}),
+            vec3_add(pos, (vec3_t){0, 0, -gizmo_size}), vec3_add(pos, (vec3_t){0, 0, gizmo_size})
+        };
+        for (int i = 0; i < 3; i++) {
+            vec4_t p1_clip = mat4_mul_vec4(vp_matrix, (vec4_t){points[i*2].x, points[i*2].y, points[i*2].z, 1.0f});
+            vec4_t p2_clip = mat4_mul_vec4(vp_matrix, (vec4_t){points[i*2+1].x, points[i*2+1].y, points[i*2+1].z, 1.0f});
+            if (p1_clip.w > 0 && p2_clip.w > 0) {
+                 int sx1=(p1_clip.x/p1_clip.w+1)*0.5f*g_framebuffer_width, sy1=(1-p1_clip.y/p1_clip.w)*0.5f*g_framebuffer_height;
+                 int sx2=(p2_clip.x/p2_clip.w+1)*0.5f*g_framebuffer_width, sy2=(1-p2_clip.y/p2_clip.w)*0.5f*g_framebuffer_height;
+                 draw_line(sx1, sy1, p1_clip.z/p1_clip.w, sx2, sy2, p2_clip.z/p2_clip.w, gizmo_color);
+            }
+        }
+        
+        // --- NEW: Draw Cone for Spot Light ---
+        if (object->light_properties->type == LIGHT_TYPE_SPOT) {
+            float cone_len = 3.0f; // Visual length of the cone
+            
+            // Get spot direction from rotation
+            mat4_t rot_matrix = mat4_mul_mat4(mat4_rotation_z(object->rotation.z), mat4_mul_mat4(mat4_rotation_y(object->rotation.y), mat4_rotation_x(object->rotation.x)));
+            vec4_t local_dir = {0, 0, -1, 0}; // Blender-style: -Z is forward
+            vec4_t world_dir4 = mat4_mul_vec4(rot_matrix, local_dir);
+            vec3_t world_dir = vec3_normalize((vec3_t){world_dir4.x, world_dir4.y, world_dir4.z});
+
+            vec3_t cone_end = vec3_add(pos, vec3_scale(world_dir, cone_len));
+            float radius = cone_len * tanf(object->light_properties->spot_angle / 2.0f);
+            
+            // Create basis vectors for the cone's base circle
+            vec3_t up_dummy = (fabs(world_dir.z) < 0.99f) ? (vec3_t){0,0,1} : (vec3_t){0,1,0};
+            vec3_t right_vec = vec3_normalize(vec3_cross(world_dir, up_dummy));
+            vec3_t up_vec = vec3_cross(right_vec, world_dir);
+
+            vec3_t circle_pts[4];
+            circle_pts[0] = vec3_add(cone_end, vec3_scale(right_vec, radius));
+            circle_pts[1] = vec3_add(cone_end, vec3_scale(up_vec, radius));
+            circle_pts[2] = vec3_add(cone_end, vec3_scale(right_vec, -radius));
+            circle_pts[3] = vec3_add(cone_end, vec3_scale(up_vec, -radius));
+
+            // Project and draw lines
+            vec4_t apex_clip = mat4_mul_vec4(vp_matrix, (vec4_t){pos.x, pos.y, pos.z, 1.0f});
+            for (int i=0; i<4; i++) {
+                vec4_t circle_clip = mat4_mul_vec4(vp_matrix, (vec4_t){circle_pts[i].x, circle_pts[i].y, circle_pts[i].z, 1.0f});
+                vec4_t next_circle_clip = mat4_mul_vec4(vp_matrix, (vec4_t){circle_pts[(i+1)%4].x, circle_pts[(i+1)%4].y, circle_pts[(i+1)%4].z, 1.0f});
+                if(apex_clip.w > 0 && circle_clip.w > 0 && next_circle_clip.w > 0) {
+                    int sx1=(apex_clip.x/apex_clip.w+1)*0.5f*g_framebuffer_width, sy1=(1-apex_clip.y/apex_clip.w)*0.5f*g_framebuffer_height;
+                    int sx2=(circle_clip.x/circle_clip.w+1)*0.5f*g_framebuffer_width, sy2=(1-circle_clip.y/circle_clip.w)*0.5f*g_framebuffer_height;
+                    int sx3=(next_circle_clip.x/next_circle_clip.w+1)*0.5f*g_framebuffer_width, sy3=(1-next_circle_clip.y/next_circle_clip.w)*0.5f*g_framebuffer_height;
+                    draw_line(sx1, sy1, apex_clip.z/apex_clip.w, sx2, sy2, circle_clip.z/circle_clip.w, gizmo_color); // From apex to circle
+                    draw_line(sx2, sy2, circle_clip.z/circle_clip.w, sx3, sy3, next_circle_clip.z/next_circle_clip.w, gizmo_color); // Circle edge
+                }
+            }
+        }
+        return; 
+    }
+    // --- END Light Gizmo Rendering ---
+
     if (!object || !object->mesh) return;
 
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
@@ -1457,26 +1578,57 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                     continue; 
                 }
                 
-                float light_intensity;
-                if (dot_product < 0) {
-                    light_intensity = vec3_dot(vec3_scale(normal, -1.0f), vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
-                } else {
-                    light_intensity = vec3_dot(normal, vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
+                vec3_t final_light_color = {0,0,0};
+                float ambient_level = 0.1f;
+                final_light_color = vec3_add(final_light_color, vec3_scale((vec3_t){1.0f, 1.0f, 1.0f}, ambient_level));
+
+                vec3_t face_center = vec3_scale(vec3_add(v0, vec3_add(v1, v2)), 1.0f/3.0f);
+
+                for (int l = 0; l < g_scene.object_count; l++) {
+                    scene_object_t* light_obj = g_scene.objects[l];
+                    if (!light_obj->light_properties) continue;
+
+                    mat4_t light_transform = mat4_get_world_transform(&g_scene, l);
+                    vec3_t light_pos = { light_transform.m[0][3], light_transform.m[1][3], light_transform.m[2][3] };
+                    
+                    vec3_t light_dir = vec3_normalize(vec3_sub(light_pos, face_center));
+                    float distance_sq = vec3_dot(vec3_sub(light_pos, face_center), vec3_sub(light_pos, face_center));
+                    if (distance_sq < 1e-6) distance_sq = 1e-6;
+
+                    vec3_t current_normal = (dot_product < 0) ? vec3_scale(normal, -1.0f) : normal;
+                    float diffuse_intensity = vec3_dot(current_normal, light_dir);
+                    if (diffuse_intensity < 0) diffuse_intensity = 0;
+
+                    float attenuation = light_obj->light_properties->intensity / distance_sq;
+
+                    if (light_obj->light_properties->type == LIGHT_TYPE_SPOT) {
+                        vec4_t local_forward = {0, 0, -1, 0};
+                        mat4_t light_rot_matrix = mat4_mul_mat4(mat4_rotation_z(light_obj->rotation.z), mat4_mul_mat4(mat4_rotation_y(light_obj->rotation.y), mat4_rotation_x(light_obj->rotation.x)));
+                        vec4_t world_forward_4d = mat4_mul_vec4(light_rot_matrix, local_forward);
+                        vec3_t spot_direction = vec3_normalize((vec3_t){world_forward_4d.x, world_forward_4d.y, world_forward_4d.z});
+
+                        float theta = vec3_dot(light_dir, vec3_scale(spot_direction, -1.0f));
+                        float epsilon = cosf(light_obj->light_properties->spot_angle / 2.0f);
+                        
+                        if (theta > epsilon) {
+                             float falloff_angle = (light_obj->light_properties->spot_angle / 2.0f) * (1.0f - light_obj->light_properties->spot_blend);
+                             float falloff_cos = cosf(falloff_angle);
+                             float spot_effect = (theta - epsilon) / (falloff_cos - epsilon);
+                             spot_effect = (spot_effect < 0.0f) ? 0.0f : (spot_effect > 1.0f) ? 1.0f : spot_effect;
+                             diffuse_intensity *= spot_effect;
+                        } else {
+                            diffuse_intensity = 0;
+                        }
+                    }
+
+                    vec3_t light_contrib = vec3_scale(light_obj->light_properties->color, diffuse_intensity * attenuation);
+                    final_light_color = vec3_add(final_light_color, light_contrib);
                 }
 
-                if (light_intensity < 0) light_intensity = 0;
-                
-                // --- COLOR CALCULATION ---
-                float ambient = 0.2f; // A bit of ambient light
-                float diffuse = light_intensity * 0.8f;
-                float total_light = ambient + diffuse;
-                if (total_light > 1.0f) total_light = 1.0f;
-
-                uint8_t r = (uint8_t)(object->color.x * total_light * 255.0f);
-                uint8_t g = (uint8_t)(object->color.y * total_light * 255.0f);
-                uint8_t b = (uint8_t)(object->color.z * total_light * 255.0f);
+                uint8_t r = (uint8_t)(fmin(1.0f, object->color.x * final_light_color.x) * 255.0f);
+                uint8_t g = (uint8_t)(fmin(1.0f, object->color.y * final_light_color.y) * 255.0f);
+                uint8_t b = (uint8_t)(fmin(1.0f, object->color.z * final_light_color.z) * 255.0f);
                 uint32_t face_color = (r << 16) | (g << 8) | b;
-                // --- END COLOR CALCULATION ---
             
                 if (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_FACES && is_object_selected && selection_contains(&g_selected_components, i)) { face_color = 0xFFFFA500; }
             
@@ -1499,7 +1651,7 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             
             uint32_t wire_color;
             if (g_current_editor_mode == EDITOR_SCENE && object->is_static) {
-                wire_color = 0xFF606060; // Dark gray for static objects
+                wire_color = 0xFF606060;
             } else {
                  wire_color = (g_current_mode==MODE_OBJECT)?(is_object_selected?0xFFFF00:0xFFFFFF):(is_object_selected?0xFFFF00:0xFF808080);
             }
@@ -1512,9 +1664,9 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                     int min=(a<b)?a:b, max=(a>b)?a:b;
                     if(selection_contains(&g_selected_components, (min<<16)|max)){ is_selected[k]=1; }
                 }
-                if (is_selected[0]) draw_thick_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, 0xFFFFA500); else draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, wire_color);
-                if (is_selected[1]) draw_thick_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, 0xFFFFA500); else draw_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, wire_color);
-                if (is_selected[2]) draw_thick_line(sp[2].x,sp[2].y,sp[2].z, sp[0].x,sp[0].y,sp[0].z, 0xFFFFA500); else draw_line(sp[2].x,sp[2].y,sp[2].z, sp[0].x,sp[0].y,sp[0].z, wire_color);
+                if(is_selected[0]) draw_thick_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, 0xFFFFA500); else draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, wire_color);
+                if(is_selected[1]) draw_thick_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, 0xFFFFA500); else draw_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, wire_color);
+                if(is_selected[2]) draw_thick_line(sp[2].x,sp[2].y,sp[2].z, sp[0].x,sp[0].y,sp[0].z, 0xFFFFA500); else draw_line(sp[2].x,sp[2].y,sp[2].z, sp[0].x,sp[0].y,sp[0].z, wire_color);
             } else {
                 draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, wire_color);
                 draw_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, wire_color);
@@ -1684,21 +1836,50 @@ int find_clicked_object(int mx, int my) {
     if(near_p_w.w!=0){near_p_w.x/=near_p_w.w; near_p_w.y/=near_p_w.w; near_p_w.z/=near_p_w.w;}
     if(far_p_w.w!=0){far_p_w.x/=far_p_w.w; far_p_w.y/=far_p_w.w; far_p_w.z/=far_p_w.w;}
     vec3_t ro={near_p_w.x,near_p_w.y,near_p_w.z}, rd=vec3_normalize(vec3_sub((vec3_t){far_p_w.x,far_p_w.y,far_p_w.z},ro));
+    
     int closest_idx=-1; float closest_dist=FLT_MAX;
+    
     for (int i=0; i<g_scene.object_count; i++){
         scene_object_t* obj=g_scene.objects[i];
-        mat4_t model_matrix = mat4_get_world_transform(&g_scene, i); // Use the full world transform
-        for(int j=0;j<obj->mesh->face_count;j++){
-            int v0i=obj->mesh->faces[j*3+0], v1i=obj->mesh->faces[j*3+1], v2i=obj->mesh->faces[j*3+2];
-            vec4_t v0w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v0i].x,obj->mesh->vertices[v0i].y,obj->mesh->vertices[v0i].z,1});
-            vec4_t v1w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v1i].x,obj->mesh->vertices[v1i].y,obj->mesh->vertices[v1i].z,1});
-            vec4_t v2w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v2i].x,obj->mesh->vertices[v2i].y,obj->mesh->vertices[v2i].z,1});
-            vec3_t v0={v0w.x,v0w.y,v0w.z}, v1={v1w.x,v1w.y,v1w.z}, v2={v2w.x,v2w.y,v2w.z};
-            float dist; if(ray_intersects_triangle(ro,rd,v0,v1,v2,&dist)){if(dist<closest_dist){closest_dist=dist; closest_idx=i;}}
-        }
-    } return closest_idx;
-}
+        mat4_t model_matrix = mat4_get_world_transform(&g_scene, i);
 
+        // --- MODIFIED: Handle both mesh and light picking ---
+        if (obj->mesh && obj->mesh->face_count > 0) { // It's a standard mesh object
+            for(int j=0;j<obj->mesh->face_count;j++){
+                int v0i=obj->mesh->faces[j*3+0], v1i=obj->mesh->faces[j*3+1], v2i=obj->mesh->faces[j*3+2];
+                vec4_t v0w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v0i].x,obj->mesh->vertices[v0i].y,obj->mesh->vertices[v0i].z,1});
+                vec4_t v1w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v1i].x,obj->mesh->vertices[v1i].y,obj->mesh->vertices[v1i].z,1});
+                vec4_t v2w=mat4_mul_vec4(model_matrix,(vec4_t){obj->mesh->vertices[v2i].x,obj->mesh->vertices[v2i].y,obj->mesh->vertices[v2i].z,1});
+                vec3_t v0={v0w.x,v0w.y,v0w.z}, v1={v1w.x,v1w.y,v1w.z}, v2={v2w.x,v2w.y,v2w.z};
+                float dist; 
+                if(ray_intersects_triangle(ro,rd,v0,v1,v2,&dist)){
+                    if(dist<closest_dist){
+                        closest_dist=dist; 
+                        closest_idx=i;
+                    }
+                }
+            }
+        } else if (obj->light_properties) { // It's a light object, use ray-sphere intersection
+            vec3_t light_pos = { model_matrix.m[0][3], model_matrix.m[1][3], model_matrix.m[2][3] };
+            const float click_radius_sq = 0.2f * 0.2f; // A small clickable radius in world space, squared
+
+            vec3_t oc = vec3_sub(ro, light_pos);
+            float b = vec3_dot(oc, rd);
+            float c = vec3_dot(oc, oc) - click_radius_sq;
+            float discriminant = b*b - c;
+
+            if (discriminant > 0) {
+                float dist = -b - sqrtf(discriminant);
+                if (dist > 0 && dist < closest_dist) {
+                    closest_dist = dist;
+                    closest_idx = i;
+                }
+            }
+        }
+        // --- END MODIFICATION ---
+    } 
+    return closest_idx;
+}
 int find_clicked_vertex(scene_object_t* object, int object_index, int mx, int my) {
     if (!object) return -1;
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
@@ -2249,9 +2430,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 if (g_selected_objects.count > 0) {
                     scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
                     if (g_current_mode == MODE_OBJECT) {
-                        obj->position = g_transform_initial_position;
-                        obj->rotation = g_transform_initial_rotation;
-                        obj->scale    = g_transform_initial_scale;
+                        if (obj->light_properties && g_current_transform_mode == TRANSFORM_LIGHT_INTENSITY) {
+                            obj->light_properties->intensity = g_transform_initial_intensity;
+                        } else {
+                            obj->position = g_transform_initial_position;
+                            obj->rotation = g_transform_initial_rotation;
+                            obj->scale    = g_transform_initial_scale;
+                        }
                     } else if (g_current_mode == MODE_EDIT && g_transform_initial_vertices) {
                         memcpy(obj->mesh->vertices, g_transform_initial_vertices, obj->mesh->vertex_count * sizeof(vec3_t));
                         free(g_transform_initial_vertices);
@@ -2265,7 +2450,9 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
         case WM_RBUTTONUP: {
             GetCursorPos(&g_last_right_click_pos);
             HMENU hMenu = CreatePopupMenu();
-            HMENU hSubMenu = CreatePopupMenu();
+            HMENU hAddMenu = CreatePopupMenu();
+            HMENU hAddMeshMenu = CreatePopupMenu();
+            HMENU hAddLightMenu = CreatePopupMenu(); // NEW
 
             if (g_current_editor_mode == EDITOR_SCENE) {
                 AppendMenu(hMenu, MF_STRING, ID_LOAD_SCENE, "Load Scene");
@@ -2279,19 +2466,34 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
             }
             
-            AppendMenu(hSubMenu, MF_STRING, ID_ADD_CUBE, "Cube");
-            AppendMenu(hSubMenu, MF_STRING, ID_ADD_PYRAMID, "Pyramid");
-            AppendMenu(hSubMenu, MF_SEPARATOR, 0, NULL);
-            AppendMenu(hSubMenu, MF_STRING, ID_ADD_FACE, "Face");
-            AppendMenu(hSubMenu, MF_STRING, ID_ADD_EDGE, "Edge");
-            AppendMenu(hSubMenu, MF_STRING, ID_ADD_VERTEX, "Vertex");
-            AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hSubMenu, "Add");
+            // Build the "Mesh" submenu
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_CUBE, "Cube");
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_PYRAMID, "Pyramid");
+            AppendMenu(hAddMeshMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_FACE, "Face");
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_EDGE, "Edge");
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_VERTEX, "Vertex");
+
+            // Build the "Light" submenu (NEW)
+            AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_POINT_LIGHT, "Point");
+            AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_SPOT_LIGHT, "Spot");
+            
+            // Build the main "Add" menu
+            AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddMeshMenu, "Mesh");
+            AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddLightMenu, "Light"); // NEW
+
+            // Add the "Add" menu to the main context menu
+            AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hAddMenu, "Add");
+
 
             if (g_selected_objects.count > 0) {
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_DELETE_OBJECT, "Delete");
                 
-                int is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
+                int is_double_sided_checked = 0;
+                if(g_scene.objects[g_selected_objects.items[0]]->mesh) { // Don't check for lights
+                    is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
+                }
                 AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
 
                 if (g_current_editor_mode == EDITOR_SCENE) {
@@ -2300,7 +2502,6 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 }
             }
             
-            // Only show parenting options in Scene Mode
             if (g_current_editor_mode == EDITOR_SCENE) {
                 if (g_selected_objects.count > 1) {
                     AppendMenu(hMenu, MF_STRING, ID_PARENT_OBJECT, "Parent");
@@ -2333,18 +2534,10 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             ScreenToClient(window_handle, &g_last_right_click_pos);
             vec3_t new_pos = get_world_pos_on_plane(g_last_right_click_pos.x, g_last_right_click_pos.y);
             switch (LOWORD(w_param)) {
-                case ID_LOAD_SCENE:
-                    trigger_load_scene_dialog();
-                    break;
-                case ID_SAVE_SCENE:
-                    trigger_save_scene_dialog();
-                    break;
-                case ID_LOAD_MODEL:
-                    trigger_load_model_dialog();
-                    break;
-                case ID_SAVE_MODEL:
-                    trigger_save_model_dialog();
-                    break;
+                case ID_LOAD_SCENE: trigger_load_scene_dialog(); break;
+                case ID_SAVE_SCENE: trigger_save_scene_dialog(); break;
+                case ID_LOAD_MODEL: trigger_load_model_dialog(); break;
+                case ID_SAVE_MODEL: trigger_save_model_dialog(); break;
                 case ID_CLEAR_SCENE:
                     scene_clear(&g_scene);
                     selection_clear(&g_selected_objects);
@@ -2352,15 +2545,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     break;
                 case ID_DELETE_OBJECT:
                     if (g_selected_objects.count > 0) {
-                        for(int i=0; i<g_selected_objects.count; ++i) {
-                            for(int j=i+1; j<g_selected_objects.count; ++j) {
-                                if(g_selected_objects.items[i] < g_selected_objects.items[j]) {
-                                    int temp = g_selected_objects.items[i];
-                                    g_selected_objects.items[i] = g_selected_objects.items[j];
-                                    g_selected_objects.items[j] = temp;
-                                }
-                            }
-                        }
+                        qsort(g_selected_objects.items, g_selected_objects.count, sizeof(int), compare_ints_desc);
                         for(int i=0; i<g_selected_objects.count; ++i) {
                             scene_remove_object(&g_scene, g_selected_objects.items[i]);
                         }
@@ -2403,6 +2588,8 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     }
                     scene_add_object(&g_scene, g_vertex_mesh_data, new_pos);
                     break;
+                case ID_ADD_POINT_LIGHT: scene_add_light(&g_scene, LIGHT_TYPE_POINT, new_pos); break;
+                case ID_ADD_SPOT_LIGHT: scene_add_light(&g_scene, LIGHT_TYPE_SPOT, new_pos); break;
                 case ID_PARENT_OBJECT:
                     if (g_current_mode == MODE_OBJECT && g_selected_objects.count > 1) {
                         int parent_index = g_selected_objects.items[g_selected_objects.count - 1];
@@ -2423,7 +2610,8 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     if (g_selected_objects.count > 0) {
                         int new_state = !g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
                         for (int i = 0; i < g_selected_objects.count; i++) {
-                            g_scene.objects[g_selected_objects.items[i]]->is_double_sided = new_state;
+                            if(g_scene.objects[g_selected_objects.items[i]]->mesh)
+                                g_scene.objects[g_selected_objects.items[i]]->is_double_sided = new_state;
                         }
                     }
                     break;
@@ -2452,6 +2640,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 float sens_translate = 0.002f * g_camera_distance;
                 float sens_rotate = 0.01f;
                 float sens_scale = 0.01f;
+                float sens_intensity = 0.1f;
 
                 if (g_current_mode == MODE_OBJECT) {
                     for (int i = 0; i < g_selected_objects.count; i++) {
@@ -2500,6 +2689,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                                     current_scale = vec3_scale(g_transform_initial_scale, scale_factor);
                                 }
                                 obj->scale = current_scale;
+                            } break;
+                            case TRANSFORM_LIGHT_INTENSITY: {
+                                if (obj->light_properties) {
+                                    float new_intensity = g_transform_initial_intensity - (float)dy_total * sens_intensity;
+                                    if (new_intensity < 0) new_intensity = 0;
+                                    obj->light_properties->intensity = new_intensity;
+                                }
                             } break;
                             case TRANSFORM_NONE: break;
                         }
@@ -2636,6 +2832,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                             free(processed_verts);
                         } break;
                         case TRANSFORM_NONE: break;
+                        case TRANSFORM_LIGHT_INTENSITY: break; // Not applicable in edit mode
                     }
                 }
             } else if (g_middle_mouse_down && (GetKeyState(VK_SHIFT) & 0x8000)) {
@@ -2672,9 +2869,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                         if (g_selected_objects.count > 0) {
                              scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
                             if (g_current_mode == MODE_OBJECT) {
-                                obj->position = g_transform_initial_position;
-                                obj->rotation = g_transform_initial_rotation;
-                                obj->scale    = g_transform_initial_scale;
+                                if (obj->light_properties && g_current_transform_mode == TRANSFORM_LIGHT_INTENSITY) {
+                                    obj->light_properties->intensity = g_transform_initial_intensity;
+                                } else {
+                                    obj->position = g_transform_initial_position;
+                                    obj->rotation = g_transform_initial_rotation;
+                                    obj->scale    = g_transform_initial_scale;
+                                }
                             } else if (g_current_mode == MODE_EDIT && g_transform_initial_vertices) {
                                 memcpy(obj->mesh->vertices, g_transform_initial_vertices, obj->mesh->vertex_count * sizeof(vec3_t));
                                 free(g_transform_initial_vertices);
@@ -2688,26 +2889,21 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 return 0;
             }
             
-            // --- NEW: Delete Component Logic ---
             if (w_param == 'X') {
                 if (g_current_mode == MODE_EDIT && g_selected_objects.count > 0 && g_selected_components.count > 0) {
                     scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
                     mesh_t* mesh = object->mesh;
 
                     if (g_edit_mode_component == EDIT_FACES) {
-                        // Sort indices in descending order to avoid messing them up as we delete
                         qsort(g_selected_components.items, g_selected_components.count, sizeof(int), compare_ints_desc);
-
                         for (int i = 0; i < g_selected_components.count; i++) {
                             mesh_delete_face(mesh, g_selected_components.items[i]);
                         }
                         selection_clear(&g_selected_components);
                     }
-                    // We will add logic for vertices and edges later
-                    return 0; // Handled
+                    return 0;
                 }
             }
-            // --- END NEW ---
 
             if (w_param == 'D' && (GetKeyState(VK_SHIFT) & 0x8000)) {
                 if (g_current_mode == MODE_OBJECT && g_selected_objects.count > 0 && g_current_transform_mode == TRANSFORM_NONE) {
@@ -2760,7 +2956,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             }
 
             if (w_param==VK_TAB) {
-                if (g_current_mode==MODE_OBJECT && g_selected_objects.count > 0) {
+                if (g_current_mode==MODE_OBJECT && g_selected_objects.count > 0 && g_scene.objects[g_selected_objects.items[0]]->mesh) { // Can only edit meshes
                     g_current_mode=MODE_EDIT;
                     g_edit_mode_component=EDIT_FACES;
                     selection_clear(&g_selected_components);
@@ -2778,38 +2974,51 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             }
             
             if (w_param == 'G' || w_param == 'R' || w_param == 'S') {
+                int is_shift_down = GetKeyState(VK_SHIFT) & 0x8000;
+                
                 int can_transform = (g_selected_objects.count > 0) && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_selected_components.count > 0));
                 
                 if (can_transform && g_current_editor_mode == EDITOR_SCENE && g_current_mode == MODE_OBJECT) {
                     for (int i = 0; i < g_selected_objects.count; i++) {
                         if (g_scene.objects[g_selected_objects.items[i]]->is_static) {
-                            can_transform = 0; // Found a static object, block transform
+                            can_transform = 0;
                             break;
                         }
                     }
                 }
+                
+                scene_object_t* first_obj = can_transform ? g_scene.objects[g_selected_objects.items[0]] : NULL;
 
                 if (can_transform) {
                     if (w_param == 'G') g_current_transform_mode = TRANSFORM_GRAB;
                     else if (w_param == 'R') g_current_transform_mode = TRANSFORM_ROTATE;
-                    else if (w_param == 'S') g_current_transform_mode = TRANSFORM_SCALE;
+                    else if (w_param == 'S') {
+                        // NEW: Check if it's a light object and not in shift-scale mode
+                        if (first_obj->light_properties && !is_shift_down) {
+                            g_current_transform_mode = TRANSFORM_LIGHT_INTENSITY;
+                        } else {
+                            g_current_transform_mode = TRANSFORM_SCALE;
+                        }
+                    }
 
                     g_transform_axis_is_locked = 0;
                     g_transform_axis = (vec3_t){0,0,0};
                     GetCursorPos(&g_transform_start_mouse_pos);
                     ScreenToClient(window_handle, &g_transform_start_mouse_pos);
                     
-                    scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
                     if (g_current_mode == MODE_OBJECT) {
-                        g_transform_initial_position = obj->position;
-                        g_transform_initial_rotation = obj->rotation;
-                        g_transform_initial_scale    = obj->scale;
-                    } else {
-                        int vc = obj->mesh->vertex_count;
+                        g_transform_initial_position = first_obj->position;
+                        g_transform_initial_rotation = first_obj->rotation;
+                        g_transform_initial_scale    = first_obj->scale;
+                        if(first_obj->light_properties) {
+                             g_transform_initial_intensity = first_obj->light_properties->intensity;
+                        }
+                    } else { // MODE_EDIT
+                        int vc = first_obj->mesh->vertex_count;
                         if(g_transform_initial_vertices) free(g_transform_initial_vertices);
                         g_transform_initial_vertices = (vec3_t*)malloc(vc * sizeof(vec3_t));
                         if (g_transform_initial_vertices) {
-                            memcpy(g_transform_initial_vertices, obj->mesh->vertices, vc * sizeof(vec3_t));
+                            memcpy(g_transform_initial_vertices, first_obj->mesh->vertices, vc * sizeof(vec3_t));
                         }
                     }
                 }
