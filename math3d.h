@@ -11,7 +11,11 @@ typedef enum {
     LIGHT_TYPE_POINT,
     LIGHT_TYPE_SPOT
 } light_type_t;
-
+typedef struct {
+    vec3_t diffuse_color;   // The base color of the object (replaces the old 'color' field)
+    float specular_intensity; // How bright the shiny spot is (0.0 to 1.0+)
+    float shininess;          // How sharp/focused the shiny spot is (e.g., 4 to 256)
+} material_t;
 typedef struct {
     light_type_t type;
     vec3_t color;
@@ -32,8 +36,8 @@ typedef struct {
     vec3_t position;    // Object's position in the world
     vec3_t rotation;    // Euler angles for rotation (in radians)
     vec3_t scale;       // Scale along each axis
-    vec3_t color;       // NEW: Object's diffuse color
-    light_t* light_properties; // NEW: If not NULL, this object is a light source
+    material_t material; // Holds diffuse color, specular, and shininess
+    light_t* light_properties; // If not NULL, this object is a light source
 
     // --- HIERARCHY FIELDS ---
     int parent_index;   // Index of the parent object in the scene's objects array (-1 for none)
@@ -45,7 +49,7 @@ typedef struct {
     char name[64];      // Name for the object, to be displayed in the UI
     RECT ui_outliner_rect; // The clickable screen-space rect for this object in the outliner
     int is_double_sided; // 0 = Backface Culling (Default), 1 = Render both sides
-    int is_static;      // NEW: 0 = Dynamic (Default), 1 = Cannot be transformed in Scene Mode
+    int is_static;      // 0 = Dynamic (Default), 1 = Cannot be transformed in Scene Mode
 } scene_object_t;
 
 typedef struct {

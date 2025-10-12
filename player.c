@@ -16,6 +16,7 @@ static void* g_framebuffer_memory;
 static float* g_depth_buffer;
 static int g_framebuffer_width;
 static int g_framebuffer_height;
+static uint32_t g_sky_color_uint = 0xFF303030; // Default dark grey
 
 // Camera and Mouse Input Variables
 static float g_camera_distance = 6.0f;
@@ -63,6 +64,9 @@ void scene_destroy(scene_t* scene) {
     for (int i = 0; i < scene->object_count; i++) {
         if (scene->objects[i]) {
             destroy_mesh_data(scene->objects[i]->mesh);
+            if (scene->objects[i]->light_properties) { // NEW
+                free(scene->objects[i]->light_properties);
+            }
             free(scene->objects[i]->children);
             free(scene->objects[i]);
         }
@@ -77,26 +81,38 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
 
     FILE* file = fopen(filename, "rb");
     if (!file) {
-        // No message box on failure in player, just return fail
         return 0;
     }
 
-    // Check header
     char header[4];
     fread(header, sizeof(char), 4, file);
-    if (strncmp(header, "SCN1", 4) != 0) {
-        fclose(file);
-        return 0; // Only support the new format
-    }
 
-    // --- Start loading ---
+    int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
+    int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
+    
+    vec3_t sky_color_vec;
+    int object_count = 0;
+
+    if (is_scn2_format) {
+        fread(&sky_color_vec, sizeof(vec3_t), 1, file);
+        fread(&object_count, sizeof(int), 1, file);
+    } else if (is_scn1_format) {
+        fread(&sky_color_vec, sizeof(vec3_t), 1, file);
+        fread(&object_count, sizeof(int), 1, file);
+    } else {
+        sky_color_vec = (vec3_t){0.1875f, 0.1875f, 0.1875f};
+        fseek(file, 0, SEEK_SET);
+        fread(&object_count, sizeof(int), 1, file);
+    }
+    
+    uint8_t r = (uint8_t)(sky_color_vec.x * 255.0f);
+    uint8_t g = (uint8_t)(sky_color_vec.y * 255.0f);
+    uint8_t b = (uint8_t)(sky_color_vec.z * 255.0f);
+    g_sky_color_uint = (r << 16) | (g << 8) | b;
+
     scene_destroy(scene);
     scene_init(scene);
 
-    int object_count = 0;
-    fread(&object_count, sizeof(int), 1, file);
-
-    // --- PASS 1: Load all objects and their parent indices ---
     for (int i = 0; i < object_count; i++) {
         if (scene->object_count >= scene->capacity) {
             scene->capacity *= 2;
@@ -106,44 +122,67 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         scene_object_t* new_obj = (scene_object_t*)malloc(sizeof(scene_object_t));
         if (!new_obj) continue;
         
-        new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
-        if (!new_obj->mesh) { free(new_obj); continue; }
-
-        // Initialize children array
         new_obj->child_count = 0;
         new_obj->child_capacity = 4;
         new_obj->children = (int*)malloc(new_obj->child_capacity * sizeof(int));
 
-        // Read transform, properties, and parent index
         fread(&new_obj->position, sizeof(vec3_t), 1, file);
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
-        fread(&new_obj->color, sizeof(vec3_t), 1, file);
-        fread(&new_obj->parent_index, sizeof(int), 1, file);
-        fread(&new_obj->is_double_sided, sizeof(int), 1, file);
-        fread(&new_obj->is_static, sizeof(int), 1, file); // <-- MODIFIED: Read property
 
-        // Read mesh data
-        fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
-        if (new_obj->mesh->vertex_count > 0) {
-            new_obj->mesh->vertices = (vec3_t*)malloc(new_obj->mesh->vertex_count * sizeof(vec3_t));
-            fread(new_obj->mesh->vertices, sizeof(vec3_t), new_obj->mesh->vertex_count, file);
+        if (is_scn2_format) {
+            fread(&new_obj->material, sizeof(material_t), 1, file);
         } else {
-            new_obj->mesh->vertices = NULL;
+            vec3_t old_color;
+            fread(&old_color, sizeof(vec3_t), 1, file);
+            new_obj->material.diffuse_color = old_color;
+            new_obj->material.specular_intensity = 0.5f;
+            new_obj->material.shininess = 32.0f;
         }
 
-        fread(&new_obj->mesh->face_count, sizeof(int), 1, file);
-        if (new_obj->mesh->face_count > 0) {
-            new_obj->mesh->faces = (int*)malloc(new_obj->mesh->face_count * 3 * sizeof(int));
-            fread(new_obj->mesh->faces, sizeof(int), new_obj->mesh->face_count * 3, file);
+        if (is_scn1_format || is_scn2_format) {
+            fread(&new_obj->parent_index, sizeof(int), 1, file);
+            fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+            fread(&new_obj->is_static, sizeof(int), 1, file);
         } else {
-            new_obj->mesh->faces = NULL;
+            new_obj->parent_index = -1;
+            new_obj->is_double_sided = 0;
+            new_obj->is_static = 0;
         }
 
+        int is_light = 0;
+        if (is_scn1_format || is_scn2_format) {
+            fread(&is_light, sizeof(int), 1, file);
+        }
+
+        if (is_light) {
+            new_obj->mesh = NULL;
+            new_obj->light_properties = (light_t*)malloc(sizeof(light_t));
+            fread(new_obj->light_properties, sizeof(light_t), 1, file);
+        } else {
+            new_obj->light_properties = NULL;
+            new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
+            if (!new_obj->mesh) { free(new_obj->children); free(new_obj); continue; }
+
+            fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
+            if (new_obj->mesh->vertex_count > 0) {
+                new_obj->mesh->vertices = (vec3_t*)malloc(new_obj->mesh->vertex_count * sizeof(vec3_t));
+                fread(new_obj->mesh->vertices, sizeof(vec3_t), new_obj->mesh->vertex_count, file);
+            } else {
+                new_obj->mesh->vertices = NULL;
+            }
+
+            fread(&new_obj->mesh->face_count, sizeof(int), 1, file);
+            if (new_obj->mesh->face_count > 0) {
+                new_obj->mesh->faces = (int*)malloc(new_obj->mesh->face_count * 3 * sizeof(int));
+                fread(new_obj->mesh->faces, sizeof(int), new_obj->mesh->face_count * 3, file);
+            } else {
+                new_obj->mesh->faces = NULL;
+            }
+        }
         scene->objects[scene->object_count++] = new_obj;
     }
 
-    // --- PASS 2: Link children to their parents ---
     for (int i = 0; i < scene->object_count; i++) {
         int parent_idx = scene->objects[i]->parent_index;
         if (parent_idx != -1 && parent_idx < scene->object_count) {
@@ -157,7 +196,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     }
 
     fclose(file);
-    return 1; // Success
+    return 1;
 }
 // --- Main Entry Point ---
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, int cmd_show) {
@@ -214,23 +253,21 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 }
 void render_frame() {
     if (!g_framebuffer_memory) return;
-    uint32_t clear_color = 0xFF303030;
+    
+    // MODIFIED: Use the loaded sky color
     uint32_t* pixel = (uint32_t*)g_framebuffer_memory;
     for (int i = 0; i < g_framebuffer_width * g_framebuffer_height; ++i) {
-        *pixel++ = clear_color;
+        *pixel++ = g_sky_color_uint;
         g_depth_buffer[i] = FLT_MAX;
     }
 
-    // --- MODIFIED: Z-Up spherical coordinate calculation (matches editor) ---
     vec3_t offset;
     offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
     offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
     offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t camera_pos = vec3_add(g_camera_target, offset);
-    // --- END MODIFICATION ---
 
-    vec3_t up_vector = {0, 0, 1}; // Z is now UP
-    // Handle gimbal lock when looking straight up or down
+    vec3_t up_vector = {0, 0, 1};
     if (fabs(sinf(g_camera_pitch)) > 0.999f) {
         up_vector = (vec3_t){0, 1, 0}; 
     }
@@ -245,10 +282,11 @@ void render_frame() {
     }
 }
 void render_object(scene_object_t* object, int object_index, mat4_t view_matrix, mat4_t projection_matrix, vec3_t camera_pos) {
-    if (!object || !object->mesh) return;
+    if (object->light_properties || !object->mesh) {
+        return;
+    }
     
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
-    
     mat4_t final_transform = mat4_mul_mat4(projection_matrix, mat4_mul_mat4(view_matrix, model_matrix));
     
     if (object->mesh->face_count > 0) {
@@ -267,55 +305,84 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             vec3_t normal = vec3_normalize(vec3_cross(vec3_sub(v1, v0), vec3_sub(v2, v0)));
             float dot_product = vec3_dot(normal, vec3_sub(camera_pos, v0));
 
-            // Respect the double-sided property
             if (!object->is_double_sided && dot_product <= 0) {
                 continue; 
             }
             
-            float light_intensity;
-            // Flip normal for backfaces if they are being rendered
-            if (dot_product < 0) {
-                light_intensity = vec3_dot(vec3_scale(normal, -1.0f), vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
-            } else {
-                light_intensity = vec3_dot(normal, vec3_normalize((vec3_t){0.5f,-0.8f,-1.0f}));
+            vec3_t diffuse_color_sum = {0,0,0};
+            vec3_t specular_color_sum = {0,0,0};
+            float ambient_level = 0.1f;
+            diffuse_color_sum = vec3_add(diffuse_color_sum, vec3_scale((vec3_t){1.0f, 1.0f, 1.0f}, ambient_level));
+            vec3_t face_center = vec3_scale(vec3_add(v0, vec3_add(v1, v2)), 1.0f/3.0f);
+
+            for (int l = 0; l < g_scene.object_count; l++) {
+                scene_object_t* light_obj = g_scene.objects[l];
+                if (!light_obj->light_properties) continue;
+
+                mat4_t light_transform = mat4_get_world_transform(&g_scene, l);
+                vec3_t light_pos = { light_transform.m[0][3], light_transform.m[1][3], light_transform.m[2][3] };
+                vec3_t light_dir = vec3_normalize(vec3_sub(light_pos, face_center));
+                float distance_sq = vec3_dot(vec3_sub(light_pos, face_center), vec3_sub(light_pos, face_center));
+                if (distance_sq < 1e-6) distance_sq = 1e-6;
+
+                vec3_t current_normal = (dot_product < 0) ? vec3_scale(normal, -1.0f) : normal;
+                float diffuse_intensity = vec3_dot(current_normal, light_dir);
+                if (diffuse_intensity < 0) diffuse_intensity = 0;
+
+                float attenuation = light_obj->light_properties->intensity / distance_sq;
+
+                if (light_obj->light_properties->type == LIGHT_TYPE_SPOT) {
+                    vec4_t local_forward = {0, 0, -1, 0};
+                    mat4_t light_rot_matrix = mat4_mul_mat4(mat4_rotation_z(light_obj->rotation.z), mat4_mul_mat4(mat4_rotation_y(light_obj->rotation.y), mat4_rotation_x(light_obj->rotation.x)));
+                    vec4_t world_forward_4d = mat4_mul_vec4(light_rot_matrix, local_forward);
+                    vec3_t spot_direction = vec3_normalize((vec3_t){world_forward_4d.x, world_forward_4d.y, world_forward_4d.z});
+
+                    float theta = vec3_dot(light_dir, vec3_scale(spot_direction, -1.0f));
+                    float epsilon = cosf(light_obj->light_properties->spot_angle / 2.0f);
+                    
+                    if (theta > epsilon) {
+                         float falloff_angle = (light_obj->light_properties->spot_angle / 2.0f) * (1.0f - light_obj->light_properties->spot_blend);
+                         float falloff_cos = cosf(falloff_angle);
+                         float spot_effect = (theta - epsilon) / (falloff_cos - epsilon);
+                         spot_effect = (spot_effect < 0.0f) ? 0.0f : (spot_effect > 1.0f) ? 1.0f : spot_effect;
+                         diffuse_intensity *= spot_effect;
+                    } else {
+                        diffuse_intensity = 0;
+                    }
+                }
+
+                vec3_t light_contrib = vec3_scale(light_obj->light_properties->color, diffuse_intensity * attenuation);
+                diffuse_color_sum = vec3_add(diffuse_color_sum, light_contrib);
+                
+                // --- NEW: SPECULAR CALCULATION ---
+                if (diffuse_intensity > 0.0f && object->material.specular_intensity > 0.0f) {
+                    vec3_t view_dir = vec3_normalize(vec3_sub(camera_pos, face_center));
+                    vec3_t reflect_dir = vec3_sub(vec3_scale(current_normal, 2.0f * vec3_dot(current_normal, light_dir)), light_dir);
+                    float spec_angle = fmax(vec3_dot(view_dir, reflect_dir), 0.0f);
+                    float specular_term = powf(spec_angle, object->material.shininess);
+                    
+                    vec3_t specular_contrib = vec3_scale(light_obj->light_properties->color, specular_term * object->material.specular_intensity * attenuation);
+                    specular_color_sum = vec3_add(specular_color_sum, specular_contrib);
+                }
             }
-
-            if (light_intensity < 0) light_intensity = 0;
-
-            // --- MODIFIED: COLOR CALCULATION ---
-            float ambient = 0.2f;
-            float diffuse = light_intensity * 0.8f;
-            float total_light = ambient + diffuse;
-            if (total_light > 1.0f) total_light = 1.0f;
-
-            uint8_t r = (uint8_t)(object->color.x * total_light * 255.0f);
-            uint8_t g = (uint8_t)(object->color.y * total_light * 255.0f);
-            uint8_t b = (uint8_t)(object->color.z * total_light * 255.0f);
+            
+            // --- MODIFIED: Combine diffuse, specular and apply to material color ---
+            vec3_t final_color = {
+                object->material.diffuse_color.x * diffuse_color_sum.x + specular_color_sum.x,
+                object->material.diffuse_color.y * diffuse_color_sum.y + specular_color_sum.y,
+                object->material.diffuse_color.z * diffuse_color_sum.z + specular_color_sum.z
+            };
+            
+            uint8_t r = (uint8_t)(fmin(1.0f, final_color.x) * 255.0f);
+            uint8_t g = (uint8_t)(fmin(1.0f, final_color.y) * 255.0f);
+            uint8_t b = (uint8_t)(fmin(1.0f, final_color.z) * 255.0f);
             uint32_t face_color = (r << 16) | (g << 8) | b;
-            // --- END MODIFICATION ---
             
             vec4_t pv[3];
             pv[0] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v0_idx].x, object->mesh->vertices[v0_idx].y, object->mesh->vertices[v0_idx].z, 1.0f});
             pv[1] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v1_idx].x, object->mesh->vertices[v1_idx].y, object->mesh->vertices[v1_idx].z, 1.0f});
             pv[2] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v2_idx].x, object->mesh->vertices[v2_idx].y, object->mesh->vertices[v2_idx].z, 1.0f});
             draw_filled_triangle(pv[0], pv[1], pv[2], face_color);
-            
-            vec4_t sp[3]; 
-            for(int j=0;j<3;++j){
-                sp[j]=pv[j]; 
-                if(sp[j].w!=0){
-                    sp[j].x/=sp[j].w; sp[j].y/=sp[j].w; sp[j].z/=sp[j].w; 
-                    sp[j].x=(sp[j].x+1.0f)*0.5f*g_framebuffer_width; 
-                    sp[j].y=(1.0f-sp[j].y)*0.5f*g_framebuffer_height;
-                }
-            }
-            
-            for (int j = 0; j < 3; j++) { sp[j].z -= 0.002f; }
-            
-            uint32_t wire_color = 0x000000; // Black wireframe
-            draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, wire_color);
-            draw_line(sp[1].x,sp[1].y,sp[1].z, sp[2].x,sp[2].y,sp[2].z, wire_color);
-            draw_line(sp[2].x,sp[2].y,sp[2].z, sp[0].x,sp[0].y,sp[0].z, wire_color);
         }
         free(transformed_vertices);
     }

@@ -125,18 +125,22 @@ void scene_set_parent(scene_t* scene, int child_index, int parent_index);
 void model_save_to_file(scene_object_t* object, const char* filename);
 void model_load_from_file(scene_t* scene, const char* filename, vec3_t position);
 void trigger_save_model_dialog(void);
+void trigger_export_selection_dialog(void);
 void trigger_load_model_dialog(void);
 void scene_destroy(scene_t* scene);
 void scene_clear(scene_t* scene);
 // --- UI and Coordinate Editing Variables ---
 static HWND g_hEdit = NULL; // Handle to the temporary edit box
 static RECT g_coord_rects[3]; // Clickable rectangles for X, Y, Z coordinates
+static RECT g_material_rects[2]; // Clickable rectangles for Specular, Shininess
 static RECT g_color_swatch_rect;
-static int g_editing_coord_axis = -1; // 0=X, 1=Y, 2=Z, -1=Not editing
+static int g_editing_coord_axis = -1; // 0=X, 1=Y, 2=Z, 3=Spec, 4=Shine, -1=Not editing
 static int g_is_box_selecting = 0;
 static RECT g_selection_box_rect;
 static shading_mode_t g_shading_mode = SHADING_SOLID;
 static RECT g_shading_rects[2];
+static vec3_t g_sky_color = {0.1875f, 0.1875f, 0.1875f}; // Default dark grey (0x303030)
+static RECT g_sky_color_swatch_rect;
 // Menu Command ID
 #define ID_DELETE_OBJECT 1001
 #define ID_ADD_CUBE 1002
@@ -156,7 +160,9 @@ static RECT g_shading_rects[2];
 #define ID_TOGGLE_STATIC 1016
 #define ID_ADD_POINT_LIGHT 1017
 #define ID_ADD_SPOT_LIGHT 1018
-
+#define ID_IMPORT_MODEL 1019
+#define ID_EXPORT_MODEL 1020
+  
 // --- Scene Management ---
 void scene_init(scene_t* scene) {
     scene->capacity = 10;
@@ -174,46 +180,51 @@ int scene_duplicate_object(scene_t* scene, int source_index) {
 
     scene_object_t* source_obj = scene->objects[source_index];
 
-    // Ensure we have capacity for the new object
     if (scene->object_count >= scene->capacity) {
         scene->capacity *= 2;
         scene->objects = (scene_object_t**)realloc(scene->objects, scene->capacity * sizeof(scene_object_t*));
     }
 
-    // Create and allocate the new object
     scene_object_t* new_object = (scene_object_t*)malloc(sizeof(scene_object_t));
     if (!new_object) return -1;
 
-    // --- Deep copy all properties from the source ---
-    new_object->mesh = mesh_copy(source_obj->mesh);
-    if (!new_object->mesh) {
-        free(new_object);
-        return -1;
+    // --- Perform a deep copy of all relevant properties ---
+    
+    // Copy mesh data if it exists
+    if (source_obj->mesh) {
+        new_object->mesh = mesh_copy(source_obj->mesh);
+    } else {
+        new_object->mesh = NULL;
+    }
+
+    // Deep copy light properties if they exist
+    if (source_obj->light_properties) {
+        new_object->light_properties = (light_t*)malloc(sizeof(light_t));
+        memcpy(new_object->light_properties, source_obj->light_properties, sizeof(light_t));
+    } else {
+        new_object->light_properties = NULL;
     }
     
     new_object->position = source_obj->position;
     new_object->rotation = source_obj->rotation;
     new_object->scale = source_obj->scale;
-    new_object->color = source_obj->color;
+    // --- MODIFIED: Copy the entire material struct ---
+    new_object->material = source_obj->material; 
     new_object->is_double_sided = source_obj->is_double_sided;
+    new_object->is_static = source_obj->is_static;
     
-    // Duplicated objects should not start with a parent.
-    // The user can re-parent them manually if desired.
     new_object->parent_index = -1;
     new_object->child_count = 0;
-    new_object->child_capacity = 4; // Start with a fresh children array
+    new_object->child_capacity = 4; 
     new_object->children = (int*)malloc(new_object->child_capacity * sizeof(int));
 
-    // Generate a new unique name
-    // Find the base name (e.g., "Cube" from "Cube.001")
     char base_name[64];
     strcpy_s(base_name, sizeof(base_name), source_obj->name);
     char* dot = strrchr(base_name, '.');
     if (dot && strspn(dot + 1, "0123456789") == strlen(dot + 1)) {
-        *dot = '\0'; // Cut off the numeric extension
+        *dot = '\0';
     }
     
-    // Find the highest existing number for this base name to avoid collisions
     int max_num = 0;
     for (int i = 0; i < scene->object_count; i++) {
         if (strncmp(scene->objects[i]->name, base_name, strlen(base_name)) == 0) {
@@ -228,7 +239,6 @@ int scene_duplicate_object(scene_t* scene, int source_index) {
     }
     sprintf_s(new_object->name, sizeof(new_object->name), "%s.%03d", base_name, max_num + 1);
 
-    // Add the new object to the scene
     int new_index = scene->object_count;
     scene->objects[new_index] = new_object;
     scene->object_count++;
@@ -261,7 +271,11 @@ void scene_add_light(scene_t* scene, light_type_t type, vec3_t pos) {
     new_light_object->position = pos;
     new_light_object->rotation = (vec3_t){ 0, 0, 0 };
     new_light_object->scale = (vec3_t){ 1, 1, 1 };
-    new_light_object->color = (vec3_t){ 1.0f, 1.0f, 0.0f }; // Gizmo/Outliner color (Yellow)
+    
+    // --- MODIFIED: Initialize material for gizmo/outliner color ---
+    new_light_object->material.diffuse_color = (vec3_t){ 1.0f, 1.0f, 0.0f }; // Gizmo/Outliner color (Yellow)
+    new_light_object->material.specular_intensity = 0.0f; // Lights shouldn't be shiny
+    new_light_object->material.shininess = 0.0f;
 
     new_light_object->parent_index = -1;
     new_light_object->child_count = 0;
@@ -302,6 +316,8 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
         return;
     }
     
+    new_object->light_properties = NULL; 
+
     if (g_current_editor_mode == EDITOR_MODEL) {
         new_object->position = (vec3_t){ 0, 0, 0 };
     } else {
@@ -309,14 +325,18 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
     }
     new_object->rotation = (vec3_t){ 0, 0, 0 };
     new_object->scale = (vec3_t){ 1, 1, 1 };
-    new_object->color = (vec3_t){ 0.8f, 0.8f, 0.8f }; // Default color
+    
+    // --- MODIFIED: Initialize material properties ---
+    new_object->material.diffuse_color = (vec3_t){ 0.8f, 0.8f, 0.8f }; // Default grey
+    new_object->material.specular_intensity = 0.5f; // Default moderate shininess
+    new_object->material.shininess = 32.0f;         // Default medium focus
 
     new_object->parent_index = -1;
     new_object->child_count = 0;
     new_object->child_capacity = 4;
     new_object->children = (int*)malloc(new_object->child_capacity * sizeof(int));
-    new_object->is_double_sided = 0; // Default to backface culling ON
-    new_object->is_static = 0;       // NEW: Default to not static
+    new_object->is_double_sided = 0;
+    new_object->is_static = 0;
 
     if (mesh_data_source == g_cube_mesh_data) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Cube.%03d", cube_count++);
@@ -330,7 +350,18 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Face.%03d", face_count++);
         new_object->is_double_sided = 1;
     } else {
-        sprintf_s(new_object->name, sizeof(new_object->name), "Object.%03d", generic_count++);
+        const char *base_name = "Object";
+        int max_num = 0;
+        for (int i = 0; i < scene->object_count; i++) {
+            if (strncmp(scene->objects[i]->name, base_name, strlen(base_name)) == 0) {
+                 const char* num_part = strrchr(scene->objects[i]->name, '.');
+                 if(num_part) {
+                     int num = atoi(num_part + 1);
+                     if (num > max_num) max_num = num;
+                 }
+            }
+        }
+        sprintf_s(new_object->name, sizeof(new_object->name), "%s.%03d", base_name, max_num + 1);
     }
 
     scene->objects[scene->object_count] = new_object;
@@ -395,10 +426,10 @@ void scene_destroy(scene_t* scene) {
     for (int i = 0; i < scene->object_count; i++) {
         if (scene->objects[i]) {
             destroy_mesh_data(scene->objects[i]->mesh);
-            if (scene->objects[i]->light_properties) {
-                free(scene->objects[i]->light_properties); // <-- NEW: Free light properties
+            if (scene->objects[i]->light_properties) { // NEW
+                free(scene->objects[i]->light_properties);
             }
-            free(scene->objects[i]->children); // <-- ADD THIS LINE
+            free(scene->objects[i]->children);
             free(scene->objects[i]);
         }
     }
@@ -416,26 +447,30 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         return 0;
     }
 
-    // --- REVISED: More robust version checking ---
     char header[4];
     fread(header, sizeof(char), 4, file);
-    int is_new_format = (strncmp(header, "SCN1", 4) == 0);
+
+    int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
+    int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
 
     int object_count = 0;
-    if (is_new_format) {
-        // New SCN1 format: Header is followed by the object count.
+    if (is_scn2_format) {
+        fread(&g_sky_color, sizeof(vec3_t), 1, file);
+        fread(&object_count, sizeof(int), 1, file);
+    } else if (is_scn1_format) {
+        // SCN1 didn't save sky color, so we must set a default.
+        g_sky_color = (vec3_t){0.1875f, 0.1875f, 0.1875f}; 
         fread(&object_count, sizeof(int), 1, file);
     } else {
-        // Old format: The first 4 bytes *were* the object count.
+        // Old headerless format
+        g_sky_color = (vec3_t){0.1875f, 0.1875f, 0.1875f};
         fseek(file, 0, SEEK_SET);
         fread(&object_count, sizeof(int), 1, file);
     }
-    // --- END REVISED ---
 
     scene_destroy(scene);
     scene_init(scene);
 
-    // --- PASS 1: Load all objects ---
     for (int i = 0; i < object_count; i++) {
         if (scene->object_count >= scene->capacity) {
             scene->capacity *= 2;
@@ -445,9 +480,6 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         scene_object_t* new_obj = (scene_object_t*)malloc(sizeof(scene_object_t));
         if (!new_obj) continue;
         
-        new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
-        if (!new_obj->mesh) { free(new_obj); continue; }
-
         new_obj->child_count = 0;
         new_obj->child_capacity = 4;
         new_obj->children = (int*)malloc(new_obj->child_capacity * sizeof(int));
@@ -456,27 +488,54 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
         
-        if (is_new_format) {
-            fread(&new_obj->color, sizeof(vec3_t), 1, file);
-            fread(&new_obj->parent_index, sizeof(int), 1, file);
-            fread(&new_obj->is_double_sided, sizeof(int), 1, file);
-            fread(&new_obj->is_static, sizeof(int), 1, file); // <-- MODIFIED: Read property
+        if (is_scn2_format) {
+            fread(&new_obj->material, sizeof(material_t), 1, file);
+        } else if (is_scn1_format) {
+            vec3_t old_color;
+            fread(&old_color, sizeof(vec3_t), 1, file);
+            new_obj->material.diffuse_color = old_color;
+            new_obj->material.specular_intensity = 0.5f;
+            new_obj->material.shininess = 32.0f;
         } else {
-            // Set defaults for old files
-            new_obj->color = (vec3_t){0.8f, 0.8f, 0.8f};
-            new_obj->parent_index = -1;
-            new_obj->is_double_sided = 0;
-            new_obj->is_static = 0; // Default old files to dynamic
+            // Defaults for the oldest format
+            new_obj->material.diffuse_color = (vec3_t){0.8f, 0.8f, 0.8f};
+            new_obj->material.specular_intensity = 0.5f;
+            new_obj->material.shininess = 32.0f;
+        }
+        
+        if (is_scn2_format || is_scn1_format) {
+             fread(&new_obj->parent_index, sizeof(int), 1, file);
+             fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+             fread(&new_obj->is_static, sizeof(int), 1, file);
+        } else {
+             new_obj->parent_index = -1;
+             new_obj->is_double_sided = 0;
+             new_obj->is_static = 0;
         }
 
-        // Read mesh data
-        fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
-        new_obj->mesh->vertices = (new_obj->mesh->vertex_count > 0) ? (vec3_t*)malloc(new_obj->mesh->vertex_count * sizeof(vec3_t)) : NULL;
-        if (new_obj->mesh->vertices) fread(new_obj->mesh->vertices, sizeof(vec3_t), new_obj->mesh->vertex_count, file);
 
-        fread(&new_obj->mesh->face_count, sizeof(int), 1, file);
-        new_obj->mesh->faces = (new_obj->mesh->face_count > 0) ? (int*)malloc(new_obj->mesh->face_count * 3 * sizeof(int)) : NULL;
-        if (new_obj->mesh->faces) fread(new_obj->mesh->faces, sizeof(int), new_obj->mesh->face_count * 3, file);
+        int is_light = 0;
+        if (is_scn2_format || is_scn1_format) {
+            fread(&is_light, sizeof(int), 1, file);
+        }
+
+        if (is_light) {
+            new_obj->mesh = NULL;
+            new_obj->light_properties = (light_t*)malloc(sizeof(light_t));
+            fread(new_obj->light_properties, sizeof(light_t), 1, file);
+        } else {
+            new_obj->light_properties = NULL;
+            new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
+            if (!new_obj->mesh) { free(new_obj->children); free(new_obj); continue; }
+
+            fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
+            new_obj->mesh->vertices = (new_obj->mesh->vertex_count > 0) ? (vec3_t*)malloc(new_obj->mesh->vertex_count * sizeof(vec3_t)) : NULL;
+            if (new_obj->mesh->vertices) fread(new_obj->mesh->vertices, sizeof(vec3_t), new_obj->mesh->vertex_count, file);
+
+            fread(&new_obj->mesh->face_count, sizeof(int), 1, file);
+            new_obj->mesh->faces = (new_obj->mesh->face_count > 0) ? (int*)malloc(new_obj->mesh->face_count * 3 * sizeof(int)) : NULL;
+            if (new_obj->mesh->faces) fread(new_obj->mesh->faces, sizeof(int), new_obj->mesh->face_count * 3, file);
+        }
 
         scene->objects[scene->object_count++] = new_obj;
     }
@@ -484,7 +543,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     // --- PASS 2: Link children to their parents ---
     for (int i = 0; i < scene->object_count; i++) {
         int parent_idx = scene->objects[i]->parent_index;
-        if (parent_idx != -1) {
+        if (parent_idx != -1 && parent_idx < scene->object_count) {
             scene_object_t* parent_obj = scene->objects[parent_idx];
             if (parent_obj->child_count >= parent_obj->child_capacity) {
                 parent_obj->child_capacity *= 2;
@@ -495,7 +554,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     }
 
     fclose(file);
-    return 1; // Success
+    return 1;
 }
 void scene_set_parent(scene_t* scene, int child_index, int parent_index) {
     // 1. --- VALIDATION ---
@@ -676,41 +735,48 @@ void trigger_load_model_dialog(void) {
 void scene_save_to_file(scene_t* scene, const char* filename) {
     if (!scene || !filename) return;
 
-    FILE* file = fopen(filename, "wb"); // Write in binary mode
+    FILE* file = fopen(filename, "wb");
     if (!file) {
         MessageBox(NULL, "Failed to open file for writing.", "Error", MB_OK | MB_ICONERROR);
         return;
     }
 
-    // Write a simple header: magic number and object count
-    char header[4] = "SCN1";
+    // Write new header "SCN2" and save all modern scene properties
+    char header[4] = "SCN2";
     fwrite(header, sizeof(char), 4, file);
+    fwrite(&g_sky_color, sizeof(vec3_t), 1, file);
     fwrite(&scene->object_count, sizeof(int), 1, file);
 
-    // Loop through each object and write its data
     for (int i = 0; i < scene->object_count; i++) {
         scene_object_t* obj = scene->objects[i];
 
-        // Write transform data
         fwrite(&obj->position, sizeof(vec3_t), 1, file);
         fwrite(&obj->rotation, sizeof(vec3_t), 1, file);
         fwrite(&obj->scale, sizeof(vec3_t), 1, file);
-        fwrite(&obj->color, sizeof(vec3_t), 1, file);
+        
+        // Write the new material struct
+        fwrite(&obj->material, sizeof(material_t), 1, file);
 
-        // Write hierarchy and property data
         fwrite(&obj->parent_index, sizeof(int), 1, file);
         fwrite(&obj->is_double_sided, sizeof(int), 1, file);
-        fwrite(&obj->is_static, sizeof(int), 1, file); // <-- NEW: Write static property
+        fwrite(&obj->is_static, sizeof(int), 1, file);
 
-        // Write mesh data
-        fwrite(&obj->mesh->vertex_count, sizeof(int), 1, file);
-        if (obj->mesh->vertex_count > 0) {
-            fwrite(obj->mesh->vertices, sizeof(vec3_t), obj->mesh->vertex_count, file);
-        }
+        int is_light = (obj->light_properties != NULL);
+        fwrite(&is_light, sizeof(int), 1, file);
 
-        fwrite(&obj->mesh->face_count, sizeof(int), 1, file);
-        if (obj->mesh->face_count > 0) {
-            fwrite(obj->mesh->faces, sizeof(int), obj->mesh->face_count * 3, file);
+        if (is_light) {
+            fwrite(obj->light_properties, sizeof(light_t), 1, file);
+        } else {
+            // It's a mesh object, write mesh data
+            fwrite(&obj->mesh->vertex_count, sizeof(int), 1, file);
+            if (obj->mesh->vertex_count > 0) {
+                fwrite(obj->mesh->vertices, sizeof(vec3_t), obj->mesh->vertex_count, file);
+            }
+
+            fwrite(&obj->mesh->face_count, sizeof(int), 1, file);
+            if (obj->mesh->face_count > 0) {
+                fwrite(obj->mesh->faces, sizeof(int), obj->mesh->face_count * 3, file);
+            }
         }
     }
 
@@ -995,23 +1061,40 @@ void destroy_and_apply_coord_edit() {
     GetWindowText(g_hEdit, buffer, sizeof(buffer));
     float new_value = (float)atof(buffer);
 
-    // Only apply if exactly one object (and one component in edit mode) is selected
-    if (g_selected_objects.count == 1 && g_editing_coord_axis != -1) {
-        int selected_obj_idx = g_selected_objects.items[0];
-        scene_object_t* object = g_scene.objects[selected_obj_idx];
+    // Check if anything is selected and we are in a valid editing state
+    if (g_selected_objects.count > 0 && g_editing_coord_axis != -1) {
         
-        vec3_t* target_pos = NULL;
-        if (g_current_mode == MODE_OBJECT) {
-            target_pos = &object->position;
-        } else if (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1) {
-            int selected_vert_idx = g_selected_components.items[0];
-            target_pos = &object->mesh->vertices[selected_vert_idx];
-        }
+        // --- Position / Vertex Editing ---
+        if (g_editing_coord_axis <= 2) {
+            if (g_selected_objects.count == 1) { // Position editing requires a single selection
+                scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
+                vec3_t* target_pos = NULL;
+                if (g_current_mode == MODE_OBJECT) {
+                    target_pos = &object->position;
+                } else if (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1) {
+                    int selected_vert_idx = g_selected_components.items[0];
+                    target_pos = &object->mesh->vertices[selected_vert_idx];
+                }
 
-        if (target_pos) {
-            if (g_editing_coord_axis == 0) target_pos->x = new_value;
-            else if (g_editing_coord_axis == 1) target_pos->y = new_value;
-            else if (g_editing_coord_axis == 2) target_pos->z = new_value;
+                if (target_pos) {
+                    if (g_editing_coord_axis == 0) target_pos->x = new_value;
+                    else if (g_editing_coord_axis == 1) target_pos->y = new_value;
+                    else if (g_editing_coord_axis == 2) target_pos->z = new_value;
+                }
+            }
+        }
+        // --- Material Property Editing ---
+        else if (g_editing_coord_axis == 3) { // Specular Intensity
+            for(int i = 0; i < g_selected_objects.count; i++) {
+                scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
+                if (!obj->light_properties) obj->material.specular_intensity = new_value;
+            }
+        }
+        else if (g_editing_coord_axis == 4) { // Shininess
+            for(int i = 0; i < g_selected_objects.count; i++) {
+                scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
+                if (!obj->light_properties) obj->material.shininess = new_value;
+            }
         }
     }
 
@@ -1156,6 +1239,78 @@ void draw_outliner_object_recursive(HDC hdc, int object_index, int depth, int* y
         draw_outliner_object_recursive(hdc, obj->children[i], depth + 1, y_offset);
     }
 }
+void draw_sky_ui(HDC hdc) {
+    int x_offset = 10;
+    // Position it below the object color and material UI
+    int y_offset = 10 + (6 * 20); // 3 lines coords + 1 color + 2 material
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, 0x00FFFFFF);
+
+    char text_buffer[] = "Sky:";
+    TextOut(hdc, x_offset, y_offset, text_buffer, strlen(text_buffer));
+    
+    SIZE text_size;
+    GetTextExtentPoint32(hdc, text_buffer, strlen(text_buffer), &text_size);
+
+    g_sky_color_swatch_rect.left = x_offset + text_size.cx + 5;
+    g_sky_color_swatch_rect.top = y_offset;
+    g_sky_color_swatch_rect.right = g_sky_color_swatch_rect.left + 50;
+    g_sky_color_swatch_rect.bottom = y_offset + text_size.cy;
+
+    uint8_t r = (uint8_t)(g_sky_color.x * 255.0f);
+    uint8_t g = (uint8_t)(g_sky_color.y * 255.0f);
+    uint8_t b = (uint8_t)(g_sky_color.z * 255.0f);
+    HBRUSH hBrush = CreateSolidBrush(RGB(r, g, b));
+
+    FillRect(hdc, &g_sky_color_swatch_rect, hBrush);
+
+    DeleteObject(hBrush);
+}
+void draw_material_ui(HDC hdc) {
+    // Only draw if one or more mesh objects are selected
+    if (g_selected_objects.count == 0) {
+        g_material_rects[0].left = -1; // Invalidate rects
+        return;
+    }
+    // Check if the primary selection is a mesh object
+    scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
+    if (object->light_properties) {
+        g_material_rects[0].left = -1;
+        return;
+    }
+    
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, 0x00FFFFFF);
+
+    char text_buffer[64];
+    int x_offset = 10;
+    // Position below the Color UI
+    int y_offset = 10 + (4 * 20); 
+
+    const char* labels[] = {"Specular: ", "Shininess: "};
+    float values[] = {object->material.specular_intensity, object->material.shininess};
+
+    for (int i = 0; i < 2; i++) {
+        // g_editing_coord_axis 3=Specular, 4=Shininess
+        if (g_hEdit && g_editing_coord_axis == (i + 3)) {
+            // Intentionally blank. We skip drawing the text label,
+            // but we MUST still increment y_offset below.
+        } else {
+            sprintf_s(text_buffer, sizeof(text_buffer), "%s%.2f", labels[i], values[i]);
+            TextOut(hdc, x_offset, y_offset, text_buffer, strlen(text_buffer));
+            
+            SIZE text_size;
+            GetTextExtentPoint32(hdc, text_buffer, strlen(text_buffer), &text_size);
+            g_material_rects[i].left = x_offset;
+            g_material_rects[i].top = y_offset;
+            g_material_rects[i].right = x_offset + text_size.cx;
+            g_material_rects[i].bottom = y_offset + text_size.cy;
+        }
+        
+        y_offset += 20; // This now runs every loop, preserving the layout.
+    }
+}
 void draw_color_ui(HDC hdc) {
     // Only draw if one or more objects are selected
     if (g_selected_objects.count == 0) {
@@ -1165,7 +1320,7 @@ void draw_color_ui(HDC hdc) {
 
     // Use the color of the first selected object for the swatch
     scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
-    vec3_t color = object->color;
+    vec3_t color = object->material.diffuse_color;
 
     int x_offset = 10;
     // Position it below the coordinate UI
@@ -1241,18 +1396,19 @@ void draw_coordinate_ui(HDC hdc) {
 
     for (int i = 0; i < 3; i++) {
         if (g_hEdit && g_editing_coord_axis == i) {
-            y_offset += 20;
-            continue;
+            // This space is intentionally left blank.
+            // We skip drawing text, but we will still increment y_offset below.
+        } else {
+            sprintf_s(text_buffer, sizeof(text_buffer), "%s%.3f", labels[i], *values[i]);
+            TextOut(hdc, x_offset, y_offset, text_buffer, strlen(text_buffer));
+            SIZE text_size;
+            GetTextExtentPoint32(hdc, text_buffer, strlen(text_buffer), &text_size);
+            g_coord_rects[i].left = x_offset;
+            g_coord_rects[i].top = y_offset;
+            g_coord_rects[i].right = x_offset + text_size.cx;
+            g_coord_rects[i].bottom = y_offset + text_size.cy;
         }
-        sprintf_s(text_buffer, sizeof(text_buffer), "%s%.3f", labels[i], *values[i]);
-        TextOut(hdc, x_offset, y_offset, text_buffer, strlen(text_buffer));
-        SIZE text_size;
-        GetTextExtentPoint32(hdc, text_buffer, strlen(text_buffer), &text_size);
-        g_coord_rects[i].left = x_offset;
-        g_coord_rects[i].top = y_offset;
-        g_coord_rects[i].right = x_offset + text_size.cx;
-        g_coord_rects[i].bottom = y_offset + text_size.cy;
-        y_offset += 20;
+        y_offset += 20; // This must run every iteration to keep spacing consistent
     }
 }
 void trigger_load_scene_dialog(void) {
@@ -1279,6 +1435,97 @@ void trigger_load_scene_dialog(void) {
             g_current_mode = MODE_OBJECT;
         }
     }
+}
+void trigger_export_selection_dialog(void) {
+    if (g_selected_objects.count == 0) {
+        MessageBox(g_window_handle, "Please select at least one mesh object to export.", "Export Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // --- 1. Calculate the center of the selection to use as the new pivot ---
+    vec3_t center = {0, 0, 0};
+    int mesh_object_count = 0;
+    for (int i = 0; i < g_selected_objects.count; i++) {
+        scene_object_t* obj = g_scene.objects[g_selected_objects.items[i]];
+        if (obj->mesh) {
+            mat4_t world_transform = mat4_get_world_transform(&g_scene, g_selected_objects.items[i]);
+            center.x += world_transform.m[0][3];
+            center.y += world_transform.m[1][3];
+            center.z += world_transform.m[2][3];
+            mesh_object_count++;
+        }
+    }
+
+    if (mesh_object_count == 0) {
+        MessageBox(g_window_handle, "The selection contains no mesh objects to export.", "Export Error", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    center = vec3_scale(center, 1.0f / (float)mesh_object_count);
+
+
+    // --- 2. Create a new, empty mesh to hold the combined result ---
+    mesh_t* combined_mesh = (mesh_t*)calloc(1, sizeof(mesh_t));
+    if (!combined_mesh) return;
+
+    // --- 3. Iterate through selected objects and combine their meshes ---
+    for (int i = 0; i < g_selected_objects.count; i++) {
+        scene_object_t* source_obj = g_scene.objects[g_selected_objects.items[i]];
+        if (!source_obj->mesh) continue; 
+
+        mat4_t world_transform = mat4_get_world_transform(&g_scene, g_selected_objects.items[i]);
+        int vertex_offset = combined_mesh->vertex_count;
+
+        // --- Append vertices, making them relative to the new pivot ---
+        int new_total_verts = combined_mesh->vertex_count + source_obj->mesh->vertex_count;
+        combined_mesh->vertices = (vec3_t*)realloc(combined_mesh->vertices, new_total_verts * sizeof(vec3_t));
+        
+        for (int v = 0; v < source_obj->mesh->vertex_count; v++) {
+            vec4_t local_pos = {source_obj->mesh->vertices[v].x, source_obj->mesh->vertices[v].y, source_obj->mesh->vertices[v].z, 1.0f};
+            vec4_t world_pos = mat4_mul_vec4(world_transform, local_pos);
+            
+            // Subtract the pivot to make the vertex local to the new model's origin
+            vec3_t final_pos = vec3_sub((vec3_t){world_pos.x, world_pos.y, world_pos.z}, center);
+
+            combined_mesh->vertices[vertex_offset + v] = final_pos;
+        }
+        
+        // --- Append faces, re-indexing them as we go ---
+        int new_total_faces = combined_mesh->face_count + source_obj->mesh->face_count;
+        combined_mesh->faces = (int*)realloc(combined_mesh->faces, new_total_faces * 3 * sizeof(int));
+
+        for (int f = 0; f < source_obj->mesh->face_count; f++) {
+            int current_face_idx = (combined_mesh->face_count + f) * 3;
+            combined_mesh->faces[current_face_idx + 0] = source_obj->mesh->faces[f*3 + 0] + vertex_offset;
+            combined_mesh->faces[current_face_idx + 1] = source_obj->mesh->faces[f*3 + 1] + vertex_offset;
+            combined_mesh->faces[current_face_idx + 2] = source_obj->mesh->faces[f*3 + 2] + vertex_offset;
+        }
+
+        combined_mesh->vertex_count = new_total_verts;
+        combined_mesh->face_count = new_total_faces;
+    }
+
+    // --- 4. Open "Save As" dialog and save the new mesh ---
+    if (combined_mesh->vertex_count > 0) {
+        OPENFILENAME ofn = {0};
+        char szFile[260] = {0};
+
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_window_handle;
+        ofn.lpstrFile = szFile;
+        ofn.nMaxFile = sizeof(szFile);
+        ofn.lpstrFilter = "Model Files\0*.model\0All Files\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+        ofn.lpstrDefExt = "model";
+
+        if (GetSaveFileName(&ofn) == TRUE) {
+            scene_object_t temp_obj = { .mesh = combined_mesh };
+            model_save_to_file(&temp_obj, ofn.lpstrFile);
+        }
+    }
+
+    // --- 5. Clean up the temporary combined mesh ---
+    destroy_mesh_data(combined_mesh);
 }
 void trigger_save_model_dialog(void) {
     if (g_selected_objects.count != 1) {
@@ -1371,9 +1618,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         HDC memory_dc = CreateCompatibleDC(window_dc);
         HBITMAP old_bitmap = (HBITMAP)SelectObject(memory_dc, g_framebuffer_bitmap);
 
+        // --- NEW: Draw Transform Axis Guide Line ---
         if (g_current_transform_mode != TRANSFORM_NONE && g_transform_axis_is_locked) {
             // Recalculate the VP matrix (same as in render_frame)
-            vec3_t offset = {.x = g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch), .y = g_camera_distance*sinf(g_camera_pitch), .z = g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+            vec3_t offset;
+            offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+            offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+            offset.z = g_camera_distance * sinf(g_camera_pitch);
             vec3_t camera_pos = vec3_add(g_camera_target, offset);
             vec3_t up_vector = {0, 0, 1}; if (fabs(sinf(g_camera_pitch)) > 0.999f) up_vector = (vec3_t){0, 1, 0}; 
             mat4_t view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
@@ -1416,10 +1667,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
                 DeleteObject(hPen);
             }
         }
+        // --- END NEW ---
 
         draw_scene_outliner(memory_dc);
         draw_coordinate_ui(memory_dc);
         draw_color_ui(memory_dc);
+        draw_material_ui(memory_dc);
+        draw_sky_ui(memory_dc);
         draw_shading_ui(memory_dc);
         draw_mode_ui(memory_dc);
         
@@ -1444,22 +1698,27 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 }
 void render_frame() {
     if (!g_framebuffer_memory) return;
-    uint32_t clear_color = 0xFF303030;
+
+    // --- MODIFIED: Use dynamic sky color ---
+    uint8_t r = (uint8_t)(g_sky_color.x * 255.0f);
+    uint8_t g = (uint8_t)(g_sky_color.y * 255.0f);
+    uint8_t b = (uint8_t)(g_sky_color.z * 255.0f);
+    uint32_t clear_color = (r << 16) | (g << 8) | b;
+    // --- END MODIFICATION ---
+
     uint32_t* pixel = (uint32_t*)g_framebuffer_memory;
     for (int i = 0; i < g_framebuffer_width * g_framebuffer_height; ++i) {
         *pixel++ = clear_color;
         g_depth_buffer[i] = FLT_MAX;
     }
 
-    // --- MODIFIED: Z-Up spherical coordinate calculation ---
     vec3_t offset;
     offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
     offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
     offset.z = g_camera_distance * sinf(g_camera_pitch);
     vec3_t camera_pos = vec3_add(g_camera_target, offset);
-    // --- END MODIFICATION ---
 
-    vec3_t up_vector = {0, 0, 1}; // Z is now UP
+    vec3_t up_vector = {0, 0, 1};
     if (fabs(sinf(g_camera_pitch)) > 0.999f) {
         up_vector = (vec3_t){0, 1, 0}; 
     }
@@ -1486,14 +1745,12 @@ void render_frame() {
     }
 }
 void render_object(scene_object_t* object, int object_index, mat4_t view_matrix, mat4_t projection_matrix, vec3_t camera_pos) {
-    // --- MODIFIED: Light Gizmo Rendering ---
     if (object->light_properties) {
         mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
         mat4_t vp_matrix = mat4_mul_mat4(projection_matrix, view_matrix);
         vec3_t pos = { model_matrix.m[0][3], model_matrix.m[1][3], model_matrix.m[2][3] };
         uint32_t gizmo_color = (selection_contains(&g_selected_objects, object_index)) ? 0xFFFFA500 : 0xFFFFFF00;
 
-        // Draw the standard 'star' gizmo for all lights
         float gizmo_size = 0.25f;
         vec3_t points[6] = {
             vec3_add(pos, (vec3_t){-gizmo_size, 0, 0}), vec3_add(pos, (vec3_t){gizmo_size, 0, 0}),
@@ -1510,31 +1767,22 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             }
         }
         
-        // --- NEW: Draw Cone for Spot Light ---
         if (object->light_properties->type == LIGHT_TYPE_SPOT) {
-            float cone_len = 3.0f; // Visual length of the cone
-            
-            // Get spot direction from rotation
+            float cone_len = 3.0f;
             mat4_t rot_matrix = mat4_mul_mat4(mat4_rotation_z(object->rotation.z), mat4_mul_mat4(mat4_rotation_y(object->rotation.y), mat4_rotation_x(object->rotation.x)));
-            vec4_t local_dir = {0, 0, -1, 0}; // Blender-style: -Z is forward
+            vec4_t local_dir = {0, 0, -1, 0};
             vec4_t world_dir4 = mat4_mul_vec4(rot_matrix, local_dir);
             vec3_t world_dir = vec3_normalize((vec3_t){world_dir4.x, world_dir4.y, world_dir4.z});
-
             vec3_t cone_end = vec3_add(pos, vec3_scale(world_dir, cone_len));
             float radius = cone_len * tanf(object->light_properties->spot_angle / 2.0f);
-            
-            // Create basis vectors for the cone's base circle
             vec3_t up_dummy = (fabs(world_dir.z) < 0.99f) ? (vec3_t){0,0,1} : (vec3_t){0,1,0};
             vec3_t right_vec = vec3_normalize(vec3_cross(world_dir, up_dummy));
             vec3_t up_vec = vec3_cross(right_vec, world_dir);
-
             vec3_t circle_pts[4];
             circle_pts[0] = vec3_add(cone_end, vec3_scale(right_vec, radius));
             circle_pts[1] = vec3_add(cone_end, vec3_scale(up_vec, radius));
             circle_pts[2] = vec3_add(cone_end, vec3_scale(right_vec, -radius));
             circle_pts[3] = vec3_add(cone_end, vec3_scale(up_vec, -radius));
-
-            // Project and draw lines
             vec4_t apex_clip = mat4_mul_vec4(vp_matrix, (vec4_t){pos.x, pos.y, pos.z, 1.0f});
             for (int i=0; i<4; i++) {
                 vec4_t circle_clip = mat4_mul_vec4(vp_matrix, (vec4_t){circle_pts[i].x, circle_pts[i].y, circle_pts[i].z, 1.0f});
@@ -1543,15 +1791,14 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                     int sx1=(apex_clip.x/apex_clip.w+1)*0.5f*g_framebuffer_width, sy1=(1-apex_clip.y/apex_clip.w)*0.5f*g_framebuffer_height;
                     int sx2=(circle_clip.x/circle_clip.w+1)*0.5f*g_framebuffer_width, sy2=(1-circle_clip.y/circle_clip.w)*0.5f*g_framebuffer_height;
                     int sx3=(next_circle_clip.x/next_circle_clip.w+1)*0.5f*g_framebuffer_width, sy3=(1-next_circle_clip.y/next_circle_clip.w)*0.5f*g_framebuffer_height;
-                    draw_line(sx1, sy1, apex_clip.z/apex_clip.w, sx2, sy2, circle_clip.z/circle_clip.w, gizmo_color); // From apex to circle
-                    draw_line(sx2, sy2, circle_clip.z/circle_clip.w, sx3, sy3, next_circle_clip.z/next_circle_clip.w, gizmo_color); // Circle edge
+                    draw_line(sx1, sy1, apex_clip.z/apex_clip.w, sx2, sy2, circle_clip.z/circle_clip.w, gizmo_color);
+                    draw_line(sx2, sy2, circle_clip.z/circle_clip.w, sx3, sy3, next_circle_clip.z/next_circle_clip.w, gizmo_color);
                 }
             }
         }
         return; 
     }
-    // --- END Light Gizmo Rendering ---
-
+    
     if (!object || !object->mesh) return;
 
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
@@ -1578,10 +1825,10 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                     continue; 
                 }
                 
-                vec3_t final_light_color = {0,0,0};
+                vec3_t diffuse_color_sum = {0,0,0};
+                vec3_t specular_color_sum = {0,0,0};
                 float ambient_level = 0.1f;
-                final_light_color = vec3_add(final_light_color, vec3_scale((vec3_t){1.0f, 1.0f, 1.0f}, ambient_level));
-
+                diffuse_color_sum = vec3_add(diffuse_color_sum, vec3_scale((vec3_t){1.0f, 1.0f, 1.0f}, ambient_level));
                 vec3_t face_center = vec3_scale(vec3_add(v0, vec3_add(v1, v2)), 1.0f/3.0f);
 
                 for (int l = 0; l < g_scene.object_count; l++) {
@@ -1590,7 +1837,6 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
 
                     mat4_t light_transform = mat4_get_world_transform(&g_scene, l);
                     vec3_t light_pos = { light_transform.m[0][3], light_transform.m[1][3], light_transform.m[2][3] };
-                    
                     vec3_t light_dir = vec3_normalize(vec3_sub(light_pos, face_center));
                     float distance_sq = vec3_dot(vec3_sub(light_pos, face_center), vec3_sub(light_pos, face_center));
                     if (distance_sq < 1e-6) distance_sq = 1e-6;
@@ -1606,10 +1852,8 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                         mat4_t light_rot_matrix = mat4_mul_mat4(mat4_rotation_z(light_obj->rotation.z), mat4_mul_mat4(mat4_rotation_y(light_obj->rotation.y), mat4_rotation_x(light_obj->rotation.x)));
                         vec4_t world_forward_4d = mat4_mul_vec4(light_rot_matrix, local_forward);
                         vec3_t spot_direction = vec3_normalize((vec3_t){world_forward_4d.x, world_forward_4d.y, world_forward_4d.z});
-
                         float theta = vec3_dot(light_dir, vec3_scale(spot_direction, -1.0f));
                         float epsilon = cosf(light_obj->light_properties->spot_angle / 2.0f);
-                        
                         if (theta > epsilon) {
                              float falloff_angle = (light_obj->light_properties->spot_angle / 2.0f) * (1.0f - light_obj->light_properties->spot_blend);
                              float falloff_cos = cosf(falloff_angle);
@@ -1622,12 +1866,31 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                     }
 
                     vec3_t light_contrib = vec3_scale(light_obj->light_properties->color, diffuse_intensity * attenuation);
-                    final_light_color = vec3_add(final_light_color, light_contrib);
+                    diffuse_color_sum = vec3_add(diffuse_color_sum, light_contrib);
+                    
+                    // --- NEW: SPECULAR CALCULATION ---
+                    if (diffuse_intensity > 0.0f && object->material.specular_intensity > 0.0f) {
+                        vec3_t view_dir = vec3_normalize(vec3_sub(camera_pos, face_center));
+                        vec3_t reflect_dir = vec3_sub(vec3_scale(current_normal, 2.0f * vec3_dot(current_normal, light_dir)), light_dir);
+                        float spec_angle = fmax(vec3_dot(view_dir, reflect_dir), 0.0f);
+                        float specular_term = powf(spec_angle, object->material.shininess);
+                        
+                        vec3_t specular_contrib = vec3_scale(light_obj->light_properties->color, specular_term * object->material.specular_intensity * attenuation);
+                        specular_color_sum = vec3_add(specular_color_sum, specular_contrib);
+                    }
+                    // --- END SPECULAR CALCULATION ---
                 }
 
-                uint8_t r = (uint8_t)(fmin(1.0f, object->color.x * final_light_color.x) * 255.0f);
-                uint8_t g = (uint8_t)(fmin(1.0f, object->color.y * final_light_color.y) * 255.0f);
-                uint8_t b = (uint8_t)(fmin(1.0f, object->color.z * final_light_color.z) * 255.0f);
+                // --- MODIFIED: Combine diffuse, specular and apply to material color ---
+                vec3_t final_color = {
+                    object->material.diffuse_color.x * diffuse_color_sum.x + specular_color_sum.x,
+                    object->material.diffuse_color.y * diffuse_color_sum.y + specular_color_sum.y,
+                    object->material.diffuse_color.z * diffuse_color_sum.z + specular_color_sum.z
+                };
+
+                uint8_t r = (uint8_t)(fmin(1.0f, final_color.x) * 255.0f);
+                uint8_t g = (uint8_t)(fmin(1.0f, final_color.y) * 255.0f);
+                uint8_t b = (uint8_t)(fmin(1.0f, final_color.z) * 255.0f);
                 uint32_t face_color = (r << 16) | (g << 8) | b;
             
                 if (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_FACES && is_object_selected && selection_contains(&g_selected_components, i)) { face_color = 0xFFFFA500; }
@@ -1643,19 +1906,15 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             pv[0] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v0_idx].x, object->mesh->vertices[v0_idx].y, object->mesh->vertices[v0_idx].z, 1.0f});
             pv[1] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v1_idx].x, object->mesh->vertices[v1_idx].y, object->mesh->vertices[v1_idx].z, 1.0f});
             pv[2] = mat4_mul_vec4(final_transform, (vec4_t){object->mesh->vertices[v2_idx].x, object->mesh->vertices[v2_idx].y, object->mesh->vertices[v2_idx].z, 1.0f});
-            
             vec4_t sp[3]; for(int j=0;j<3;++j){sp[j]=pv[j]; if(sp[j].w!=0){sp[j].x/=sp[j].w;sp[j].y/=sp[j].w;sp[j].z/=sp[j].w; sp[j].x=(sp[j].x+1.0f)*0.5f*g_framebuffer_width; sp[j].y=(1.0f-sp[j].y)*0.5f*g_framebuffer_height;}}
-            
             const float depth_offset = 0.002f;
             for (int j = 0; j < 3; j++) { sp[j].z -= depth_offset; }
-            
             uint32_t wire_color;
             if (g_current_editor_mode == EDITOR_SCENE && object->is_static) {
                 wire_color = 0xFF606060;
             } else {
                  wire_color = (g_current_mode==MODE_OBJECT)?(is_object_selected?0xFFFF00:0xFFFFFF):(is_object_selected?0xFFFF00:0xFF808080);
             }
-            
             int v_indices[3] = {v0_idx, v1_idx, v2_idx};
             if (g_current_mode==MODE_EDIT && g_edit_mode_component==EDIT_EDGES && is_object_selected) {
                 int is_selected[3] = {0,0,0};
@@ -2201,13 +2460,27 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             }
         } break;
         case WM_LBUTTONDOWN: {
-            if (g_hEdit) {
-                destroy_and_apply_coord_edit();
-            }
             int mouse_x = LOWORD(l_param);
             int mouse_y = HIWORD(l_param);
             POINT pt = {mouse_x, mouse_y};
-            
+
+            if (g_hEdit) {
+                RECT edit_rect;
+                GetWindowRect(g_hEdit, &edit_rect); // Gets screen coordinates
+                
+                POINT screen_pt = pt;
+                ClientToScreen(window_handle, &screen_pt); // Convert click to screen coordinates
+
+                if (!PtInRect(&edit_rect, screen_pt)) {
+                    // Click was outside the edit box, so apply and destroy it.
+                    destroy_and_apply_coord_edit();
+                } else {
+                    // Click was inside the edit box. Let the edit control handle it.
+                    // We must not process any further UI clicks in this message.
+                    return 0; 
+                }
+            }
+
             for (int i = 0; i < 2; i++) {
                 if (PtInRect(&g_mode_rects[i], pt)) {
                     editor_mode_t new_mode = (editor_mode_t)i;
@@ -2242,7 +2515,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 cc.hwndOwner = window_handle;
                 cc.lpCustColors = (LPDWORD) acrCustClr;
                 
-                vec3_t initial_color = g_scene.objects[g_selected_objects.items[0]]->color;
+                vec3_t initial_color = g_scene.objects[g_selected_objects.items[0]]->material.diffuse_color;
                 cc.rgbResult = RGB((BYTE)(initial_color.x * 255), (BYTE)(initial_color.y * 255), (BYTE)(initial_color.z * 255));
                 cc.Flags = CC_FULLOPEN | CC_RGBINIT;
 
@@ -2253,26 +2526,62 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     new_color.z = GetBValue(cc.rgbResult) / 255.0f;
 
                     for (int i = 0; i < g_selected_objects.count; i++) {
-                        g_scene.objects[g_selected_objects.items[i]]->color = new_color;
+                        g_scene.objects[g_selected_objects.items[i]]->material.diffuse_color = new_color;
                     }
                 }
                 return 0;
             }
 
-            int can_edit_coords = (g_selected_objects.count == 1) && g_current_transform_mode == TRANSFORM_NONE && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1));
-            if (can_edit_coords) {
-                for (int i = 0; i < 3; i++) {
-                    if (PtInRect(&g_coord_rects[i], pt)) {
-                        g_editing_coord_axis = i;
-                        int selected_obj_idx = g_selected_objects.items[0];
-                        scene_object_t* object = g_scene.objects[selected_obj_idx];
-                        vec3_t current_pos = (g_current_mode == MODE_OBJECT) ? object->position : object->mesh->vertices[g_selected_components.items[0]];
-                        float* values[] = {&current_pos.x, &current_pos.y, &current_pos.z};
-                        char buffer[32];
-                        sprintf_s(buffer, sizeof(buffer), "%.3f", *values[i]);
-                        g_hEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", buffer, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_WANTRETURN, g_coord_rects[i].left, g_coord_rects[i].top, g_coord_rects[i].right-g_coord_rects[i].left+20, g_coord_rects[i].bottom-g_coord_rects[i].top, window_handle, (HMENU)ID_EDIT_COORD, GetModuleHandle(NULL), NULL);
-                        if(g_hEdit){ SetFocus(g_hEdit); SendMessage(g_hEdit, EM_SETSEL, 0, -1); }
-                        return 0;
+            if (PtInRect(&g_sky_color_swatch_rect, pt)) {
+                CHOOSECOLOR cc;
+                static COLORREF acrCustClr[16]; 
+                ZeroMemory(&cc, sizeof(cc));
+                cc.lStructSize = sizeof(cc);
+                cc.hwndOwner = window_handle;
+                cc.lpCustColors = (LPDWORD) acrCustClr;
+                
+                cc.rgbResult = RGB((BYTE)(g_sky_color.x * 255), (BYTE)(g_sky_color.y * 255), (BYTE)(g_sky_color.z * 255));
+                cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+                if (ChooseColor(&cc) == TRUE) {
+                    g_sky_color.x = GetRValue(cc.rgbResult) / 255.0f;
+                    g_sky_color.y = GetGValue(cc.rgbResult) / 255.0f;
+                    g_sky_color.z = GetBValue(cc.rgbResult) / 255.0f;
+                }
+                return 0;
+            }
+            
+            int can_edit_props = g_selected_objects.count > 0 && g_current_transform_mode == TRANSFORM_NONE;
+            if (can_edit_props) {
+                scene_object_t* object = g_scene.objects[g_selected_objects.items[0]];
+
+                int can_edit_coords = (g_selected_objects.count == 1) && (g_current_mode == MODE_OBJECT || (g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count == 1));
+                if (can_edit_coords) {
+                    for (int i = 0; i < 3; i++) {
+                        if (PtInRect(&g_coord_rects[i], pt)) {
+                            g_editing_coord_axis = i;
+                            vec3_t current_pos = (g_current_mode == MODE_OBJECT) ? object->position : object->mesh->vertices[g_selected_components.items[0]];
+                            float* values[] = {&current_pos.x, &current_pos.y, &current_pos.z};
+                            char buffer[32];
+                            sprintf_s(buffer, sizeof(buffer), "%.3f", *values[i]);
+                            g_hEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", buffer, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_WANTRETURN, g_coord_rects[i].left, g_coord_rects[i].top, g_coord_rects[i].right-g_coord_rects[i].left+20, g_coord_rects[i].bottom-g_coord_rects[i].top, window_handle, (HMENU)ID_EDIT_COORD, GetModuleHandle(NULL), NULL);
+                            if(g_hEdit){ SetFocus(g_hEdit); SendMessage(g_hEdit, EM_SETSEL, 0, -1); }
+                            return 0;
+                        }
+                    }
+                }
+
+                if (!object->light_properties) {
+                     for (int i = 0; i < 2; i++) {
+                        if (PtInRect(&g_material_rects[i], pt)) {
+                            g_editing_coord_axis = i + 3;
+                            float values[] = {object->material.specular_intensity, object->material.shininess};
+                            char buffer[32];
+                            sprintf_s(buffer, sizeof(buffer), "%.2f", values[i]);
+                            g_hEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", buffer, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_WANTRETURN, g_material_rects[i].left, g_material_rects[i].top, g_material_rects[i].right-g_material_rects[i].left+20, g_material_rects[i].bottom-g_material_rects[i].top, window_handle, (HMENU)ID_EDIT_COORD, GetModuleHandle(NULL), NULL);
+                            if(g_hEdit){ SetFocus(g_hEdit); SendMessage(g_hEdit, EM_SETSEL, 0, -1); }
+                            return 0;
+                        }
                     }
                 }
             }
@@ -2357,9 +2666,12 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                         mat4_t world_matrix = mat4_get_world_transform(&g_scene, i);
                         vec3_t p = {world_matrix.m[0][3], world_matrix.m[1][3], world_matrix.m[2][3]};
 
-                        vec3_t offset={.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+                        vec3_t offset;
+                        offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                        offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                        offset.z = g_camera_distance * sinf(g_camera_pitch);
                         vec3_t cam_pos=vec3_add(g_camera_target, offset);
-                        mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+                        mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,0,1});
                         mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_framebuffer_width/(float)g_framebuffer_height, 0.1f, 100.0f);
                         mat4_t final = mat4_mul_mat4(proj, view);
                         vec4_t clip = mat4_mul_vec4(final, (vec4_t){p.x, p.y, p.z, 1.0f});
@@ -2377,9 +2689,12 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     scene_object_t* object = g_scene.objects[obj_idx];
                     mat4_t model_matrix = mat4_get_world_transform(&g_scene, obj_idx);
                     
-                    vec3_t offset={.x=g_camera_distance*sinf(g_camera_yaw)*cosf(g_camera_pitch),.y=g_camera_distance*sinf(g_camera_pitch),.z=g_camera_distance*cosf(g_camera_yaw)*cosf(g_camera_pitch)};
+                    vec3_t offset;
+                    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                    offset.z = g_camera_distance * sinf(g_camera_pitch);
                     vec3_t cam_pos=vec3_add(g_camera_target, offset);
-                    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,1,0});
+                    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,0,1});
                     mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_framebuffer_width/(float)g_framebuffer_height, 0.1f, 100.0f);
                     mat4_t final = mat4_mul_mat4(proj, mat4_mul_mat4(view, model_matrix));
                     
@@ -2452,15 +2767,29 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             HMENU hMenu = CreatePopupMenu();
             HMENU hAddMenu = CreatePopupMenu();
             HMENU hAddMeshMenu = CreatePopupMenu();
-            HMENU hAddLightMenu = CreatePopupMenu(); // NEW
+            HMENU hAddLightMenu = CreatePopupMenu();
 
             if (g_current_editor_mode == EDITOR_SCENE) {
                 AppendMenu(hMenu, MF_STRING, ID_LOAD_SCENE, "Load Scene");
                 AppendMenu(hMenu, MF_STRING, ID_SAVE_SCENE, "Save Scene");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenu(hMenu, MF_STRING, ID_IMPORT_MODEL, "Import Model...");
+                
+                int can_export = 0;
+                for (int i = 0; i < g_selected_objects.count; i++) {
+                    if (g_scene.objects[g_selected_objects.items[i]]->mesh) {
+                        can_export = 1;
+                        break;
+                    }
+                }
+                if (can_export) {
+                    AppendMenu(hMenu, MF_STRING, ID_EXPORT_MODEL, "Export Selection As Model...");
+                }
+
+                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
             } else { // EDITOR_MODEL
-                AppendMenu(hMenu, MF_STRING, ID_LOAD_MODEL, "Load Model");
-                AppendMenu(hMenu, MF_STRING, ID_SAVE_MODEL, "Save Model");
+                AppendMenu(hMenu, MF_STRING, ID_LOAD_MODEL, "Load Model...");
+                AppendMenu(hMenu, MF_STRING, ID_SAVE_MODEL, "Save Model As...");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_CLEAR_SCENE, "New Model");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -2474,13 +2803,13 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_EDGE, "Edge");
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_VERTEX, "Vertex");
 
-            // Build the "Light" submenu (NEW)
+            // Build the "Light" submenu
             AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_POINT_LIGHT, "Point");
             AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_SPOT_LIGHT, "Spot");
             
             // Build the main "Add" menu
             AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddMeshMenu, "Mesh");
-            AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddLightMenu, "Light"); // NEW
+            AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddLightMenu, "Light");
 
             // Add the "Add" menu to the main context menu
             AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hAddMenu, "Add");
@@ -2490,11 +2819,18 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_DELETE_OBJECT, "Delete");
                 
-                int is_double_sided_checked = 0;
-                if(g_scene.objects[g_selected_objects.items[0]]->mesh) { // Don't check for lights
-                    is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
+                int show_double_sided = 0;
+                for(int i=0; i < g_selected_objects.count; i++) {
+                    if (g_scene.objects[g_selected_objects.items[i]]->mesh) {
+                        show_double_sided = 1;
+                        break;
+                    }
                 }
-                AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
+                if (show_double_sided) {
+                    int is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
+                    AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
+                }
+
 
                 if (g_current_editor_mode == EDITOR_SCENE) {
                     int is_static_checked = g_scene.objects[g_selected_objects.items[0]]->is_static;
@@ -2538,10 +2874,15 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                 case ID_SAVE_SCENE: trigger_save_scene_dialog(); break;
                 case ID_LOAD_MODEL: trigger_load_model_dialog(); break;
                 case ID_SAVE_MODEL: trigger_save_model_dialog(); break;
+                case ID_IMPORT_MODEL: trigger_load_model_dialog(); break;
+                case ID_EXPORT_MODEL: trigger_export_selection_dialog(); break;
                 case ID_CLEAR_SCENE:
                     scene_clear(&g_scene);
                     selection_clear(&g_selected_objects);
                     selection_clear(&g_selected_components);
+                    if (g_current_editor_mode == EDITOR_MODEL) {
+                        scene_add_object(&g_scene, g_cube_mesh_data, (vec3_t){0,0,0});
+                    }
                     break;
                 case ID_DELETE_OBJECT:
                     if (g_selected_objects.count > 0) {
@@ -2832,7 +3173,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                             free(processed_verts);
                         } break;
                         case TRANSFORM_NONE: break;
-                        case TRANSFORM_LIGHT_INTENSITY: break; // Not applicable in edit mode
+                        case TRANSFORM_LIGHT_INTENSITY: break;
                     }
                 }
             } else if (g_middle_mouse_down && (GetKeyState(VK_SHIFT) & 0x8000)) {
@@ -2855,8 +3196,14 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
         case WM_KEYDOWN: {
             if ((GetKeyState(VK_CONTROL) & 0x8000)) {
                 switch(w_param) {
-                    case 'S': trigger_save_scene_dialog(); return 0;
-                    case 'O': trigger_load_scene_dialog(); return 0;
+                    case 'S': 
+                        if (g_current_editor_mode == EDITOR_SCENE) trigger_save_scene_dialog();
+                        else trigger_save_model_dialog();
+                        return 0;
+                    case 'O': 
+                        if (g_current_editor_mode == EDITOR_SCENE) trigger_load_scene_dialog();
+                        else trigger_load_model_dialog();
+                        return 0;
                 }
             }
             
@@ -2956,7 +3303,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             }
 
             if (w_param==VK_TAB) {
-                if (g_current_mode==MODE_OBJECT && g_selected_objects.count > 0 && g_scene.objects[g_selected_objects.items[0]]->mesh) { // Can only edit meshes
+                if (g_current_mode==MODE_OBJECT && g_selected_objects.count > 0 && g_scene.objects[g_selected_objects.items[0]]->mesh) {
                     g_current_mode=MODE_EDIT;
                     g_edit_mode_component=EDIT_FACES;
                     selection_clear(&g_selected_components);
@@ -2993,7 +3340,6 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                     if (w_param == 'G') g_current_transform_mode = TRANSFORM_GRAB;
                     else if (w_param == 'R') g_current_transform_mode = TRANSFORM_ROTATE;
                     else if (w_param == 'S') {
-                        // NEW: Check if it's a light object and not in shift-scale mode
                         if (first_obj->light_properties && !is_shift_down) {
                             g_current_transform_mode = TRANSFORM_LIGHT_INTENSITY;
                         } else {
@@ -3013,7 +3359,7 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
                         if(first_obj->light_properties) {
                              g_transform_initial_intensity = first_obj->light_properties->intensity;
                         }
-                    } else { // MODE_EDIT
+                    } else { 
                         int vc = first_obj->mesh->vertex_count;
                         if(g_transform_initial_vertices) free(g_transform_initial_vertices);
                         g_transform_initial_vertices = (vec3_t*)malloc(vc * sizeof(vec3_t));
