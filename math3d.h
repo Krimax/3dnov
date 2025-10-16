@@ -28,6 +28,7 @@ typedef struct {
 typedef struct {
     vec3_t* vertices;   // Dynamic array of vertices
     int* faces;         // Dynamic array of face indices (3 per triangle)
+    vec3_t* normals;    // Dynamic array of per-vertex normal vectors
     int vertex_count;
     int face_count;
 } mesh_t;
