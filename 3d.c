@@ -73,6 +73,7 @@ static mesh_t* g_sphere_mesh_data = NULL;
 static mesh_t* g_vertex_mesh_data = NULL;
 static mesh_t* g_edge_mesh_data = NULL;
 static mesh_t* g_face_mesh_data = NULL;
+static mesh_t* g_player_spawn_mesh_data = NULL;
 // --- Edit Mode Variables ---
 typedef enum { MODE_OBJECT, MODE_EDIT } operating_mode_t;
 typedef enum { EDIT_FACES, EDIT_VERTICES, EDIT_EDGES } edit_component_mode_t;
@@ -202,7 +203,11 @@ static RECT g_sky_color_swatch_rect;
 #define ID_IMPORT_MODEL 1019
 #define ID_EXPORT_MODEL 1020
 #define ID_ADD_SPHERE 1021
-  
+#define ID_ADD_PLAYER_SPAWN 1022
+#define ID_TOGGLE_COLLISION 1023
+#define ID_SET_PLAYER_MODEL 1024
+#define ID_SET_CAMERA_TARGET 1025
+
 // --- Scene Management ---
 void scene_init(scene_t* scene) {
     scene->capacity = 10;
@@ -389,6 +394,9 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
     }
     
     new_object->light_properties = NULL; 
+    new_object->is_player_spawn = 0;
+    new_object->is_player_model = 0;
+    new_object->camera_offset = (vec3_t){0, 0, 0};
 
     if (g_current_editor_mode == EDITOR_MODEL) {
         new_object->position = (vec3_t){ 0, 0, 0 };
@@ -406,10 +414,16 @@ void scene_add_object(scene_t* scene, mesh_t* mesh_data_source, vec3_t pos) {
     new_object->child_count = 0;
     new_object->child_capacity = 4;
     new_object->children = (int*)malloc(new_object->child_capacity * sizeof(int));
-    new_object->is_double_sided = 1; // <-- MODIFIED: All objects are now double-sided by default
+    new_object->is_double_sided = 1;
     new_object->is_static = 0;
+    new_object->has_collision = 1; // Default to having collision
 
-    if (mesh_data_source == g_cube_mesh_data) {
+    if (mesh_data_source == g_player_spawn_mesh_data) {
+        sprintf_s(new_object->name, sizeof(new_object->name), "PlayerSpawn");
+        new_object->material.diffuse_color = (vec3_t){1.0f, 0.0f, 0.0f};
+        new_object->is_player_spawn = 1;
+        new_object->has_collision = 0; // The spawn point itself shouldn't have collision
+    } else if (mesh_data_source == g_cube_mesh_data) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Cube.%03d", cube_count++);
     } else if (mesh_data_source == g_pyramid_mesh_data) {
         sprintf_s(new_object->name, sizeof(new_object->name), "Pyramid.%03d", pyramid_count++);
@@ -522,19 +536,18 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     char header[4];
     fread(header, sizeof(char), 4, file);
 
+    int is_scn3_format = (strncmp(header, "SCN3", 4) == 0);
     int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
     int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
 
     int object_count = 0;
-    if (is_scn2_format) {
+    if (is_scn3_format || is_scn2_format) {
         fread(&g_sky_color, sizeof(vec3_t), 1, file);
         fread(&object_count, sizeof(int), 1, file);
     } else if (is_scn1_format) {
-        // SCN1 didn't save sky color, so we must set a default.
         g_sky_color = (vec3_t){0.1875f, 0.1875f, 0.1875f}; 
         fread(&object_count, sizeof(int), 1, file);
     } else {
-        // Old headerless format
         g_sky_color = (vec3_t){0.1875f, 0.1875f, 0.1875f};
         fseek(file, 0, SEEK_SET);
         fread(&object_count, sizeof(int), 1, file);
@@ -560,7 +573,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
         
-        if (is_scn2_format) {
+        if (is_scn3_format || is_scn2_format) {
             fread(&new_obj->material, sizeof(material_t), 1, file);
         } else if (is_scn1_format) {
             vec3_t old_color;
@@ -569,25 +582,48 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->material.specular_intensity = 0.5f;
             new_obj->material.shininess = 32.0f;
         } else {
-            // Defaults for the oldest format
             new_obj->material.diffuse_color = (vec3_t){0.8f, 0.8f, 0.8f};
             new_obj->material.specular_intensity = 0.5f;
             new_obj->material.shininess = 32.0f;
         }
         
-        if (is_scn2_format || is_scn1_format) {
+        if (is_scn3_format) {
              fread(&new_obj->parent_index, sizeof(int), 1, file);
              fread(&new_obj->is_double_sided, sizeof(int), 1, file);
              fread(&new_obj->is_static, sizeof(int), 1, file);
+             fread(&new_obj->is_player_spawn, sizeof(int), 1, file);
+             fread(&new_obj->has_collision, sizeof(int), 1, file);
+             fread(&new_obj->is_player_model, sizeof(int), 1, file);
+             fread(&new_obj->camera_offset, sizeof(vec3_t), 1, file);
+        } else if (is_scn2_format) {
+             fread(&new_obj->parent_index, sizeof(int), 1, file);
+             fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+             fread(&new_obj->is_static, sizeof(int), 1, file);
+             fread(&new_obj->is_player_spawn, sizeof(int), 1, file);
+             fread(&new_obj->has_collision, sizeof(int), 1, file);
+             new_obj->is_player_model = 0;
+             new_obj->camera_offset = (vec3_t){0,0,0};
+        } else if (is_scn1_format) {
+             fread(&new_obj->parent_index, sizeof(int), 1, file);
+             fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+             fread(&new_obj->is_static, sizeof(int), 1, file);
+             new_obj->is_player_spawn = 0;
+             new_obj->has_collision = 1; // <-- SET DEFAULT
+             new_obj->is_player_model = 0;
+             new_obj->camera_offset = (vec3_t){0,0,0};
         } else {
              new_obj->parent_index = -1;
              new_obj->is_double_sided = 0;
              new_obj->is_static = 0;
+             new_obj->is_player_spawn = 0;
+             new_obj->has_collision = 1; // <-- SET DEFAULT
+             new_obj->is_player_model = 0;
+             new_obj->camera_offset = (vec3_t){0,0,0};
         }
 
 
         int is_light = 0;
-        if (is_scn2_format || is_scn1_format) {
+        if (is_scn3_format || is_scn2_format || is_scn1_format) {
             fread(&is_light, sizeof(int), 1, file);
         }
 
@@ -599,7 +635,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->light_properties = NULL;
             new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
             if (!new_obj->mesh) { free(new_obj->children); free(new_obj); continue; }
-            new_obj->mesh->normals = NULL; // Initialize pointer
+            new_obj->mesh->normals = NULL;
 
             fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
             new_obj->mesh->vertices = (new_obj->mesh->vertex_count > 0) ? (vec3_t*)malloc(new_obj->mesh->vertex_count * sizeof(vec3_t)) : NULL;
@@ -609,7 +645,6 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->mesh->faces = (new_obj->mesh->face_count > 0) ? (int*)malloc(new_obj->mesh->face_count * 3 * sizeof(int)) : NULL;
             if (new_obj->mesh->faces) fread(new_obj->mesh->faces, sizeof(int), new_obj->mesh->face_count * 3, file);
 
-            // --- NEW: Calculate normals after loading geometry ---
             mesh_calculate_normals(new_obj->mesh);
         }
 
@@ -822,8 +857,7 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         return;
     }
 
-    // Write new header "SCN2" and save all modern scene properties
-    char header[4] = "SCN2";
+    char header[4] = "SCN3"; // NEW FORMAT
     fwrite(header, sizeof(char), 4, file);
     fwrite(&g_sky_color, sizeof(vec3_t), 1, file);
     fwrite(&scene->object_count, sizeof(int), 1, file);
@@ -835,12 +869,16 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         fwrite(&obj->rotation, sizeof(vec3_t), 1, file);
         fwrite(&obj->scale, sizeof(vec3_t), 1, file);
         
-        // Write the new material struct
         fwrite(&obj->material, sizeof(material_t), 1, file);
 
         fwrite(&obj->parent_index, sizeof(int), 1, file);
         fwrite(&obj->is_double_sided, sizeof(int), 1, file);
         fwrite(&obj->is_static, sizeof(int), 1, file);
+        fwrite(&obj->is_player_spawn, sizeof(int), 1, file);
+        fwrite(&obj->has_collision, sizeof(int), 1, file);
+        fwrite(&obj->is_player_model, sizeof(int), 1, file); // <-- NEW
+        fwrite(&obj->camera_offset, sizeof(vec3_t), 1, file); // <-- NEW
+
 
         int is_light = (obj->light_properties != NULL);
         fwrite(&is_light, sizeof(int), 1, file);
@@ -848,7 +886,6 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         if (is_light) {
             fwrite(obj->light_properties, sizeof(light_t), 1, file);
         } else {
-            // It's a mesh object, write mesh data
             fwrite(&obj->mesh->vertex_count, sizeof(int), 1, file);
             if (obj->mesh->vertex_count > 0) {
                 fwrite(obj->mesh->vertices, sizeof(vec3_t), obj->mesh->vertex_count, file);
@@ -1262,6 +1299,37 @@ mesh_t* create_sphere_mesh(int segments, int rings) {
     // We no longer call the generic normal calculation function for the sphere
     // mesh_calculate_normals(mesh); 
 
+    return mesh;
+}
+mesh_t* create_player_spawn_mesh(void) {
+    mesh_t* mesh = (mesh_t*)malloc(sizeof(mesh_t));
+    if (!mesh) return NULL;
+    mesh->vertex_count = 5;
+    mesh->vertices = (vec3_t*)malloc(mesh->vertex_count * sizeof(vec3_t));
+    // Base vertices on the XY plane (at Z = 0)
+    mesh->vertices[0] = (vec3_t){-0.4f, -0.4f, 0.0f};
+    mesh->vertices[1] = (vec3_t){ 0.4f, -0.4f, 0.0f};
+    mesh->vertices[2] = (vec3_t){ 0.4f,  0.4f, 0.0f};
+    mesh->vertices[3] = (vec3_t){-0.4f,  0.4f, 0.0f};
+    // Apex vertex (height is along the Z axis)
+    mesh->vertices[4] = (vec3_t){ 0.0f,  0.0f,  1.5f}; // Taller than a regular pyramid
+
+    mesh->face_count = 6;
+    mesh->faces = (int*)malloc(mesh->face_count * 3 * sizeof(int));
+    int i=0;
+
+    // Base faces (winding order is clockwise so normal points down, -Z)
+    mesh->faces[i++]=0; mesh->faces[i++]=2; mesh->faces[i++]=1;
+    mesh->faces[i++]=0; mesh->faces[i++]=3; mesh->faces[i++]=2;
+
+    // Side faces (winding order is base-edge -> apex so normal points outwards)
+    mesh->faces[i++]=0; mesh->faces[i++]=1; mesh->faces[i++]=4;
+    mesh->faces[i++]=1; mesh->faces[i++]=2; mesh->faces[i++]=4;
+    mesh->faces[i++]=2; mesh->faces[i++]=3; mesh->faces[i++]=4;
+    mesh->faces[i++]=3; mesh->faces[i++]=0; mesh->faces[i++]=4;
+
+    mesh->normals = NULL;
+    mesh_calculate_normals(mesh);
     return mesh;
 }
 mesh_t* create_pyramid_mesh(void) {
@@ -1886,6 +1954,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     g_vertex_mesh_data = create_vertex_mesh();
     g_edge_mesh_data = create_edge_mesh();
     g_face_mesh_data = create_face_mesh();
+    g_player_spawn_mesh_data = create_player_spawn_mesh(); // <-- ADD THIS LINE
     
     scene_add_object(&g_scene, g_cube_mesh_data, (vec3_t){-1.0f, 0.0f, 0.0f});
     scene_add_object(&g_scene, g_pyramid_mesh_data, (vec3_t){1.0f, 0.0f, 0.0f});
@@ -1966,7 +2035,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
             DeleteObject(hPen);
         }
         
-        // --- MODIFIED: Stretch the finished low-res image to fill the high-res window ---
         StretchDIBits(window_dc, 
                       0, 0, g_window_width, g_window_height, 
                       0, 0, g_render_width, g_render_height, 
@@ -2163,7 +2231,6 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             vec4_t p1_clip = mat4_mul_vec4(vp_matrix, (vec4_t){points[i*2].x, points[i*2].y, points[i*2].z, 1.0f});
             vec4_t p2_clip = mat4_mul_vec4(vp_matrix, (vec4_t){points[i*2+1].x, points[i*2+1].y, points[i*2+1].z, 1.0f});
             if (p1_clip.w > 0 && p2_clip.w > 0) {
-                 // --- FIXED: Use render width and height ---
                  int sx1=(p1_clip.x/p1_clip.w+1)*0.5f*g_render_width, sy1=(1-p1_clip.y/p1_clip.w)*0.5f*g_render_height;
                  int sx2=(p2_clip.x/p2_clip.w+1)*0.5f*g_render_width, sy2=(1-p2_clip.y/p2_clip.w)*0.5f*g_render_height;
                  draw_line(sx1, sy1, p1_clip.z/p1_clip.w, sx2, sy2, p2_clip.z/p2_clip.w, gizmo_color);
@@ -2191,7 +2258,6 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                 vec4_t circle_clip = mat4_mul_vec4(vp_matrix, (vec4_t){circle_pts[i].x, circle_pts[i].y, circle_pts[i].z, 1.0f});
                 vec4_t next_circle_clip = mat4_mul_vec4(vp_matrix, (vec4_t){circle_pts[(i+1)%4].x, circle_pts[(i+1)%4].y, circle_pts[(i+1)%4].z, 1.0f});
                 if(apex_clip.w > 0 && circle_clip.w > 0 && next_circle_clip.w > 0) {
-                    // --- FIXED: Use render width and height ---
                     int sx1=(apex_clip.x/apex_clip.w+1)*0.5f*g_render_width, sy1=(1-apex_clip.y/apex_clip.w)*0.5f*g_render_height;
                     int sx2=(circle_clip.x/circle_clip.w+1)*0.5f*g_render_width, sy2=(1-circle_clip.y/circle_clip.w)*0.5f*g_render_height;
                     int sx3=(next_circle_clip.x/next_circle_clip.w+1)*0.5f*g_render_width, sy3=(1-next_circle_clip.y/next_circle_clip.w)*0.5f*g_render_height;
@@ -2221,7 +2287,7 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
     int is_object_selected = selection_contains(&g_selected_objects, object_index);
     int use_precomputed_colors = 0;
 
-    if (g_shading_mode == SHADING_SMOOTH && object->mesh->normals) {
+    if (g_shading_mode == SHADING_SMOOTH && object->mesh->normals && !object->is_player_spawn) { // Player spawn is always solid color
         use_precomputed_colors = 1;
         
         if (object->material.specular_intensity > 0.0f) {
@@ -2336,7 +2402,11 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                 }
                 
                 uint32_t wire_color;
-                if (g_current_editor_mode == EDITOR_SCENE && object->is_static) {
+                if (object->is_player_spawn) { 
+                    wire_color = 0xFFFF0000; // Red
+                } else if (object->is_player_model) { // <-- NEW
+                    wire_color = 0xFF00FF00; // Bright Green
+                } else if (g_current_editor_mode == EDITOR_SCENE && object->is_static) {
                     wire_color = 0xFF606060;
                 } else {
                     wire_color = (g_current_mode==MODE_OBJECT)?(is_object_selected?0xFFFF00:0xFFFFFF):(is_object_selected?0xFFFF00:0xFF808080);
@@ -2347,6 +2417,22 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             }
         }
     } 
+    
+    // --- NEW: Draw camera offset gizmo ---
+    if (object->is_player_model) {
+        vec4_t offset_local = {object->camera_offset.x, object->camera_offset.y, object->camera_offset.z, 1.0f};
+        vec4_t offset_clip = mat4_mul_vec4(final_transform, offset_local);
+
+        if (offset_clip.w > 0) {
+            float sx = (offset_clip.x / offset_clip.w + 1.0f) * 0.5f * g_render_width;
+            float sy = (1.0f - offset_clip.y / offset_clip.w) * 0.5f * g_render_height;
+            float sz = offset_clip.z / offset_clip.w;
+            
+            // Draw a small cyan 'X'
+            draw_line(sx - 3, sy - 3, sz - 0.003f, sx + 3, sy + 3, sz - 0.003f, 0xFFFFFF00);
+            draw_line(sx - 3, sy + 3, sz - 0.003f, sx + 3, sy - 3, sz - 0.003f, 0xFFFFFF00);
+        }
+    }
     
     int should_draw_markers = (g_current_mode == MODE_EDIT && is_object_selected) || (object->mesh->face_count == 0 && is_object_selected);
     if (should_draw_markers) {
@@ -2802,18 +2888,21 @@ void draw_filled_triangle(vec4_t p0, vec4_t p1, vec4_t p2, uint32_t c) {
     float p1w_inv = 1.0f / p1.w; p1.x *= p1w_inv; p1.y *= p1w_inv; p1.z *= p1w_inv;
     float p2w_inv = 1.0f / p2.w; p2.x *= p2w_inv; p2.y *= p2w_inv; p2.z *= p2w_inv;
 
-    // --- MODIFIED: Use render resolution for screen space transform ---
+    // Screen space transform
     p0.x = (p0.x + 1.0f) * 0.5f * g_render_width; p0.y = (1.0f - p0.y) * 0.5f * g_render_height;
     p1.x = (p1.x + 1.0f) * 0.5f * g_render_width; p1.y = (1.0f - p1.y) * 0.5f * g_render_height;
-    p2.x = (p2.x + 1.0f) * 0.5f * g_render_width; p2.y = (1.0f - p2.y) * 0.5f * g_render_height;
+    p2.x = (p2.x + 1.0f) * 0.5f * g_render_width; p2.y = (1.0f - p2.y) * 0.5f * g_render_height; // <-- THIS LINE IS FIXED
 
     // Sort vertices by Y
     if (p0.y > p1.y) { vec4_t t = p0; p0 = p1; p1 = t; float tw = p0w_inv; p0w_inv = p1w_inv; p1w_inv = tw; }
     if (p0.y > p2.y) { vec4_t t = p0; p0 = p2; p2 = t; float tw = p0w_inv; p0w_inv = p2w_inv; p2w_inv = tw; }
     if (p1.y > p2.y) { vec4_t t = p1; p1 = p2; p2 = t; float tw = p1w_inv; p1w_inv = p2w_inv; p2w_inv = tw; }
 
-    int y_start = (int)fmax(0, ceil(p0.y - 0.5f));
-    int y_end = (int)fmin(g_render_height, ceil(p2.y - 0.5f));
+    int y_start = (int)(p0.y + 0.5f);
+    int y_end = (int)(p2.y + 0.5f);
+
+    y_start = (y_start < 0) ? 0 : y_start;
+    y_end = (y_end > g_render_height) ? g_render_height : y_end;
     
     float dy_total = p2.y - p0.y;
     float dy_split = p1.y - p0.y;
@@ -2839,25 +2928,31 @@ void draw_filled_triangle(vec4_t p0, vec4_t p1, vec4_t p2, uint32_t c) {
             float temp_w = wa_inv; wa_inv = wb_inv; wb_inv = temp_w;
         }
 
-        int x_start = (int)fmax(0, ceil(xa_f - 0.5f));
-        int x_end = (int)fmin(g_render_width, ceil(xb_f - 0.5f));
+        int x_start = (int)(xa_f + 0.5f);
+        int x_end = (int)(xb_f + 0.5f);
+
+        x_start = (x_start < 0) ? 0 : x_start;
+        x_end = (x_end > g_render_width) ? g_render_width : x_end;
         
         float scanline_width = xb_f - xa_f;
-        float w_step = (scanline_width > 0) ? (wb_inv - wa_inv) / scanline_width : 0;
+        if (scanline_width <= 0) continue;
+
+        float w_inv_step = (wb_inv - wa_inv) / scanline_width;
+        float initial_offset = (float)x_start - xa_f;
+        float current_w_inv = wa_inv + w_inv_step * initial_offset;
         
         uint32_t* row = (uint32_t*)g_framebuffer_memory + y * g_render_width;
         float* depth_row = g_depth_buffer + y * g_render_width;
 
         for (int x = x_start; x < x_end; x++) {
-            float t = (xa_f == xb_f) ? 0.0f : (x - xa_f) / (xb_f - xa_f);
-            float w_inv = wa_inv + t * (wb_inv - wa_inv);
-            if (w_inv > 0) {
-                float z = 1.0f / w_inv;
+            if (current_w_inv > 0) {
+                float z = 1.0f / current_w_inv;
                 if (z < depth_row[x]) {
                     row[x] = c;
                     depth_row[x] = z;
                 }
             }
+            current_w_inv += w_inv_step;
         }
     }
 }
@@ -2869,10 +2964,10 @@ void draw_gouraud_triangle(vec4_t p0, vec4_t p1, vec4_t p2, vec3_t c0, vec3_t c1
     float p1w_inv = 1.0f / p1.w; p1.x *= p1w_inv; p1.y *= p1w_inv; p1.z *= p1w_inv;
     float p2w_inv = 1.0f / p2.w; p2.x *= p2w_inv; p2.y *= p2w_inv; p2.z *= p2w_inv;
 
-    // --- MODIFIED: Use render resolution for screen space transform ---
-    p0.x = (p0.x + 1.0f) * 0.5f * g_render_width; p0.y = (1.0f - p0.y) * 0.5f * g_render_height;
-    p1.x = (p1.x + 1.0f) * 0.5f * g_render_width; p1.y = (1.0f - p1.y) * 0.5f * g_render_height;
-    p2.x = (p2.x + 1.0f) * 0.5f * g_render_width; p2.y = (1.0f - p2.y) * 0.5f * g_render_height;
+    // Screen space transform
+    p0.x = (p0.x + 1.0f) * 0.5f * g_render_width;  p0.y = (1.0f - p0.y) * 0.5f * g_render_height;
+    p1.x = (p1.x + 1.0f) * 0.5f * g_render_width;  p1.y = (1.0f - p1.y) * 0.5f * g_render_height;
+    p2.x = (p2.x + 1.0f) * 0.5f * g_render_width;  p2.y = (1.0f - p2.y) * 0.5f * g_render_height;
 
     // Pre-calculate colors divided by w for perspective-correct interpolation
     vec3_t c0_pw = vec3_scale(c0, p0w_inv);
@@ -2884,8 +2979,11 @@ void draw_gouraud_triangle(vec4_t p0, vec4_t p1, vec4_t p2, vec3_t c0, vec3_t c1
     if (p0.y > p2.y) { vec4_t tp = p0; p0 = p2; p2 = tp; vec3_t tc = c0_pw; c0_pw = c2_pw; c2_pw = tc; float tw = p0w_inv; p0w_inv = p2w_inv; p2w_inv = tw; }
     if (p1.y > p2.y) { vec4_t tp = p1; p1 = p2; p2 = tp; vec3_t tc = c1_pw; c1_pw = c2_pw; c2_pw = tc; float tw = p1w_inv; p1w_inv = p2w_inv; p2w_inv = tw; }
 
-    int y_start = (int)fmax(0, ceil(p0.y - 0.5f));
-    int y_end = (int)fmin(g_render_height, ceil(p2.y - 0.5f));
+    int y_start = (int)(p0.y + 0.5f);
+    int y_end = (int)(p2.y + 0.5f);
+
+    y_start = (y_start < 0) ? 0 : y_start;
+    y_end = (y_end > g_render_height) ? g_render_height : y_end;
 
     float dy_total = p2.y - p0.y;
     float dy_split = p1.y - p0.y;
@@ -2910,8 +3008,11 @@ void draw_gouraud_triangle(vec4_t p0, vec4_t p1, vec4_t p2, vec3_t c0, vec3_t c1
             vec3_t temp_c = ca_pw; ca_pw = cb_pw; cb_pw = temp_c;
         }
 
-        int x_start = (int)fmax(0, ceil(xa_f - 0.5f));
-        int x_end = (int)fmin(g_render_width, ceil(xb_f - 0.5f));
+        int x_start = (int)(xa_f + 0.5f);
+        int x_end = (int)(xb_f + 0.5f);
+
+        x_start = (x_start < 0) ? 0 : x_start;
+        x_end = (x_end > g_render_width) ? g_render_width : x_end;
 
         float scanline_width = xb_f - xa_f;
         if (scanline_width <= 0) continue;
@@ -2979,7 +3080,7 @@ void draw_thick_line(int x0, int y0, float z0, int x1, int y1, float z1, uint32_
 LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_param, LPARAM l_param) {
     LRESULT result = 0;
     switch (message) {
-        case WM_CLOSE: case WM_DESTROY: {
+case WM_CLOSE: case WM_DESTROY: {
             scene_destroy(&g_scene);
             selection_destroy(&g_selected_objects);
             selection_destroy(&g_selected_components);
@@ -2989,8 +3090,8 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             destroy_mesh_data(g_vertex_mesh_data);
             destroy_mesh_data(g_edge_mesh_data);
             destroy_mesh_data(g_face_mesh_data);
+            destroy_mesh_data(g_player_spawn_mesh_data);
             if(g_transform_initial_vertices) free(g_transform_initial_vertices);
-            // --- NEW: Free the reusable vertex buffers ---
             if(g_clip_coords_buffer) free(g_clip_coords_buffer);
             if(g_colors_buffer) free(g_colors_buffer);
             PostQuitMessage(0);
@@ -3372,47 +3473,61 @@ case WM_RBUTTONUP: {
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
             }
             
-            // Build the "Mesh" submenu
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_CUBE, "Cube");
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_PYRAMID, "Pyramid");
-            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_SPHERE, "Sphere"); // <-- ADD THIS LINE
+            AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_SPHERE, "Sphere");
             AppendMenu(hAddMeshMenu, MF_SEPARATOR, 0, NULL);
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_FACE, "Face");
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_EDGE, "Edge");
             AppendMenu(hAddMeshMenu, MF_STRING, ID_ADD_VERTEX, "Vertex");
 
-            // Build the "Light" submenu
             AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_POINT_LIGHT, "Point");
             AppendMenu(hAddLightMenu, MF_STRING, ID_ADD_SPOT_LIGHT, "Spot");
             
-            // Build the main "Add" menu
             AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddMeshMenu, "Mesh");
             AppendMenu(hAddMenu, MF_POPUP, (UINT_PTR)hAddLightMenu, "Light");
+            
+            if (g_current_editor_mode == EDITOR_SCENE) {
+                AppendMenu(hAddMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenu(hAddMenu, MF_STRING, ID_ADD_PLAYER_SPAWN, "Player Spawn");
+            }
 
-            // Add the "Add" menu to the main context menu
             AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hAddMenu, "Add");
-
 
             if (g_selected_objects.count > 0) {
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_DELETE_OBJECT, "Delete");
                 
-                int show_double_sided = 0;
-                for(int i=0; i < g_selected_objects.count; i++) {
-                    if (g_scene.objects[g_selected_objects.items[i]]->mesh) {
-                        show_double_sided = 1;
-                        break;
+                if (g_selected_objects.count == 1) {
+                    scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
+
+                    if (obj->mesh) {
+                        AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+
+                        int is_player_model_checked = obj->is_player_model;
+                        AppendMenu(hMenu, MF_STRING | (is_player_model_checked ? MF_CHECKED : MF_UNCHECKED), ID_SET_PLAYER_MODEL, "Player Model");
+                        
+                        if (is_player_model_checked) {
+                            UINT flags = MF_STRING;
+                            if (g_current_mode != MODE_EDIT || g_edit_mode_component != EDIT_VERTICES || g_selected_components.count == 0) {
+                                flags |= MF_GRAYED;
+                            }
+                            AppendMenu(hMenu, flags, ID_SET_CAMERA_TARGET, "Set Camera Target from Selection");
+                        }
+                        
+                        AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+
+                        int is_double_sided_checked = obj->is_double_sided;
+                        AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
+
+                        int is_collision_checked = obj->has_collision;
+                        AppendMenu(hMenu, MF_STRING | (is_collision_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_COLLISION, "Collision");
                     }
-                }
-                if (show_double_sided) {
-                    int is_double_sided_checked = g_scene.objects[g_selected_objects.items[0]]->is_double_sided;
-                    AppendMenu(hMenu, MF_STRING | (is_double_sided_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_DOUBLE_SIDED, "Double Sided");
-                }
 
-
-                if (g_current_editor_mode == EDITOR_SCENE) {
-                    int is_static_checked = g_scene.objects[g_selected_objects.items[0]]->is_static;
-                    AppendMenu(hMenu, MF_STRING | (is_static_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_STATIC, "Static");
+                    if (g_current_editor_mode == EDITOR_SCENE) {
+                        int is_static_checked = obj->is_static;
+                        AppendMenu(hMenu, MF_STRING | (is_static_checked ? MF_CHECKED : MF_UNCHECKED), ID_TOGGLE_STATIC, "Static");
+                    }
                 }
             }
             
@@ -3486,13 +3601,28 @@ case WM_COMMAND: {
                     }
                     scene_add_object(&g_scene, g_pyramid_mesh_data, new_pos);
                     break;
-                case ID_ADD_SPHERE: // <-- ADD THIS CASE BLOCK
+                case ID_ADD_SPHERE:
                     if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
                         MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
                         break;
                     }
                     scene_add_object(&g_scene, g_sphere_mesh_data, new_pos);
                     break;
+                case ID_ADD_PLAYER_SPAWN: {
+                    int spawn_exists = 0;
+                    for (int i = 0; i < g_scene.object_count; i++) {
+                        if (g_scene.objects[i]->is_player_spawn) {
+                            spawn_exists = 1;
+                            break;
+                        }
+                    }
+                    if (spawn_exists) {
+                        MessageBox(g_window_handle, "A Player Spawn object already exists in the scene.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        scene_add_object(&g_scene, g_player_spawn_mesh_data, new_pos);
+                    }
+                    break;
+                }
                 case ID_ADD_FACE:
                     if (g_current_editor_mode == EDITOR_MODEL && g_scene.object_count > 0) {
                         MessageBox(g_window_handle, "Model Mode only supports one object. Use 'New Model' to start over.", "Action Blocked", MB_OK | MB_ICONINFORMATION);
@@ -3541,6 +3671,16 @@ case WM_COMMAND: {
                         }
                     }
                     break;
+                case ID_TOGGLE_COLLISION: 
+                    if (g_selected_objects.count > 0) {
+                        int new_state = !g_scene.objects[g_selected_objects.items[0]]->has_collision;
+                        for (int i = 0; i < g_selected_objects.count; i++) {
+                            if (g_scene.objects[g_selected_objects.items[i]]->mesh) {
+                                g_scene.objects[g_selected_objects.items[i]]->has_collision = new_state;
+                            }
+                        }
+                    }
+                    break;
                 case ID_TOGGLE_STATIC:
                     if (g_selected_objects.count > 0) {
                         int new_state = !g_scene.objects[g_selected_objects.items[0]]->is_static;
@@ -3549,9 +3689,38 @@ case WM_COMMAND: {
                         }
                     }
                     break;
+                case ID_SET_PLAYER_MODEL:
+                    if (g_selected_objects.count == 1) {
+                        int selected_idx = g_selected_objects.items[0];
+                        // Toggle the state
+                        int new_state = !g_scene.objects[selected_idx]->is_player_model;
+                        
+                        // If we are setting this object as the player model,
+                        // we must first unset any other object that might have the flag.
+                        if (new_state == 1) {
+                            for (int i = 0; i < g_scene.object_count; i++) {
+                                g_scene.objects[i]->is_player_model = 0;
+                            }
+                        }
+                        g_scene.objects[selected_idx]->is_player_model = new_state;
+                    }
+                    break;
+                case ID_SET_CAMERA_TARGET:
+                    if (g_selected_objects.count == 1 && g_current_mode == MODE_EDIT && g_edit_mode_component == EDIT_VERTICES && g_selected_components.count > 0) {
+                        scene_object_t* obj = g_scene.objects[g_selected_objects.items[0]];
+                        
+                        // Calculate the average position of the selected vertices
+                        vec3_t center = {0, 0, 0};
+                        for (int i = 0; i < g_selected_components.count; i++) {
+                            int vert_idx = g_selected_components.items[i];
+                            center = vec3_add(center, obj->mesh->vertices[vert_idx]);
+                        }
+                        obj->camera_offset = vec3_scale(center, 1.0f / g_selected_components.count);
+                    }
+                    break;
             }
         } break;
-case WM_MOUSEMOVE: {
+        case WM_MOUSEMOVE: {
             int cur_x=LOWORD(l_param), cur_y=HIWORD(l_param), dx=cur_x-g_last_mouse_x, dy=cur_y-g_last_mouse_y;
             
             if (g_current_tool == TOOL_DRAW_FACE && g_mouse_down) {
@@ -3569,8 +3738,11 @@ case WM_MOUSEMOVE: {
             }
             else if (g_is_box_selecting) {
                 g_mouse_dragged = 1;
-                g_selection_box_rect.right = cur_x;
-                g_selection_box_rect.bottom = cur_y;
+                // --- MODIFIED: Scale current mouse position to render space ---
+                float scaled_mx = (float)cur_x * ((float)g_render_width / (float)g_window_width);
+                float scaled_my = (float)cur_y * ((float)g_render_height / (float)g_window_height);
+                g_selection_box_rect.right = (int)scaled_mx;
+                g_selection_box_rect.bottom = (int)scaled_my;
             } else if (g_current_transform_mode != TRANSFORM_NONE) {
                 if(g_selected_objects.count == 0) break;
                 

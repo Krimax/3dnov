@@ -19,8 +19,10 @@ static HWND g_window_handle;
 static BITMAPINFO g_framebuffer_info;
 static void* g_framebuffer_memory;
 static float* g_depth_buffer;
-static int g_framebuffer_width;
-static int g_framebuffer_height;
+static int g_window_width;
+static int g_window_height;
+static int g_render_width;
+static int g_render_height;
 static uint32_t g_sky_color_uint = 0xFF303030; // Default dark grey
 
 // Camera and Mouse Input Variables
@@ -34,7 +36,27 @@ static int g_last_mouse_y = 0;
 
 // Scene Management
 static scene_t g_scene;
+static LARGE_INTEGER g_perf_counter_freq; // For delta time calculation
+static LARGE_INTEGER g_last_perf_counter;
+// --- Player State Variables ---
+static vec3_t g_player_position = {0, 0, 1}; // Player's current world position
+static vec3_t g_player_velocity = {0, 0, 0}; // Player's current velocity
+static float g_player_yaw = 0.0f;           // Horizontal look angle (around Z axis)
+static float g_player_pitch = 0.0f;         // Vertical look angle
+static int g_player_on_ground = 0;          // Is the player currently standing on a surface?
+static int g_player_active = 0;             // Is the player logic running? (Set after finding spawn)
+static int g_mouse_is_free = 0;             // 0 = Locked for FPS control, 1 = Free
+static int g_player_model_index = -1;       // Index of the object used as the player model
 
+#define PLAYER_HEIGHT 1.8f
+#define PLAYER_EYE_HEIGHT 1.6f
+#define PLAYER_RADIUS 0.1f
+#define PLAYER_SPEED 5.0f
+#define PLAYER_GRAVITY -18.0f
+#define PLAYER_JUMP_FORCE 8.0f
+static vec4_t* g_clip_coords_buffer = NULL;
+static vec3_t* g_colors_buffer = NULL;
+static int g_vertex_buffer_capacity = 0;
 // --- Function Declarations ---
 LRESULT CALLBACK window_callback(HWND, UINT, WPARAM, LPARAM);
 void render_frame();
@@ -43,6 +65,7 @@ void draw_line(int x0, int y0, float z0, int x1, int y1, float z1, uint32_t colo
 void draw_gouraud_triangle(vec4_t p0, vec4_t p1, vec4_t p2, vec3_t c0, vec3_t c1, vec3_t c2);
 void render_object(scene_object_t* object, int object_index, mat4_t view_matrix, mat4_t projection_matrix, vec3_t camera_pos);
 void render_grid(mat4_t view_matrix, mat4_t projection_matrix);
+void update_player(float dt);
 
 // Scene I/O
 void scene_init(scene_t* scene);
@@ -135,21 +158,20 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     char header[4];
     fread(header, sizeof(char), 4, file);
 
+    int is_scn3_format = (strncmp(header, "SCN3", 4) == 0);
     int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
     int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
     
     vec3_t sky_color_vec;
     int object_count = 0;
 
-    if (is_scn2_format) {
+    if (is_scn3_format || is_scn2_format) {
         fread(&sky_color_vec, sizeof(vec3_t), 1, file);
         fread(&object_count, sizeof(int), 1, file);
     } else if (is_scn1_format) {
-        // SCN1 didn't save sky color, so we must set a default.
         sky_color_vec = (vec3_t){0.1875f, 0.1875f, 0.1875f}; 
         fread(&object_count, sizeof(int), 1, file);
     } else {
-        // Old headerless format
         sky_color_vec = (vec3_t){0.1875f, 0.1875f, 0.1875f};
         fseek(file, 0, SEEK_SET);
         fread(&object_count, sizeof(int), 1, file);
@@ -180,9 +202,9 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
 
-        if (is_scn2_format) {
+        if (is_scn3_format || is_scn2_format) {
             fread(&new_obj->material, sizeof(material_t), 1, file);
-        } else { // Covers SCN1 and older formats
+        } else { 
             vec3_t old_color;
             fread(&old_color, sizeof(vec3_t), 1, file);
             new_obj->material.diffuse_color = old_color;
@@ -190,18 +212,42 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->material.shininess = 32.0f;
         }
 
-        if (is_scn1_format || is_scn2_format) {
+        if (is_scn3_format) {
             fread(&new_obj->parent_index, sizeof(int), 1, file);
             fread(&new_obj->is_double_sided, sizeof(int), 1, file);
             fread(&new_obj->is_static, sizeof(int), 1, file);
+            fread(&new_obj->is_player_spawn, sizeof(int), 1, file);
+            fread(&new_obj->has_collision, sizeof(int), 1, file);
+            fread(&new_obj->is_player_model, sizeof(int), 1, file);
+            fread(&new_obj->camera_offset, sizeof(vec3_t), 1, file);
+        } else if (is_scn2_format) {
+            fread(&new_obj->parent_index, sizeof(int), 1, file);
+            fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+            fread(&new_obj->is_static, sizeof(int), 1, file);
+            fread(&new_obj->is_player_spawn, sizeof(int), 1, file);
+            fread(&new_obj->has_collision, sizeof(int), 1, file);
+            new_obj->is_player_model = 0;
+            new_obj->camera_offset = (vec3_t){0,0,0};
+        } else if (is_scn1_format) {
+            fread(&new_obj->parent_index, sizeof(int), 1, file);
+            fread(&new_obj->is_double_sided, sizeof(int), 1, file);
+            fread(&new_obj->is_static, sizeof(int), 1, file);
+            new_obj->is_player_spawn = 0;
+            new_obj->has_collision = 1; // <-- SET DEFAULT
+            new_obj->is_player_model = 0;
+            new_obj->camera_offset = (vec3_t){0,0,0};
         } else {
             new_obj->parent_index = -1;
             new_obj->is_double_sided = 0;
             new_obj->is_static = 0;
+            new_obj->is_player_spawn = 0;
+            new_obj->has_collision = 1; // <-- SET DEFAULT
+            new_obj->is_player_model = 0;
+            new_obj->camera_offset = (vec3_t){0,0,0};
         }
 
         int is_light = 0;
-        if (is_scn1_format || is_scn2_format) {
+        if (is_scn3_format || is_scn2_format || is_scn1_format) {
             fread(&is_light, sizeof(int), 1, file);
         }
 
@@ -213,7 +259,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->light_properties = NULL;
             new_obj->mesh = (mesh_t*)malloc(sizeof(mesh_t));
             if (!new_obj->mesh) { free(new_obj->children); free(new_obj); continue; }
-            new_obj->mesh->normals = NULL; // Initialize pointer
+            new_obj->mesh->normals = NULL;
 
             fread(&new_obj->mesh->vertex_count, sizeof(int), 1, file);
             if (new_obj->mesh->vertex_count > 0) {
@@ -231,7 +277,6 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
                 new_obj->mesh->faces = NULL;
             }
             
-            // --- NEW: Calculate normals after loading geometry ---
             mesh_calculate_normals(new_obj->mesh);
         }
         scene->objects[scene->object_count++] = new_obj;
@@ -262,17 +307,35 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
     if (!RegisterClass(&window_class)) return 0;
     
-    g_framebuffer_width = 800;
-    g_framebuffer_height = 600;
+    g_window_width = 1280;
+    g_window_height = 720;
+    g_render_width = 800;
+    g_render_height = 600;
     
     g_window_handle = CreateWindowEx(0, window_class.lpszClassName, "My C 3D Player", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, g_framebuffer_width, g_framebuffer_height, NULL, NULL, instance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, g_window_width, g_window_height, NULL, NULL, instance, NULL);
     
     if (g_window_handle == NULL) return 0;
+    
+    g_framebuffer_info.bmiHeader.biSize = sizeof(g_framebuffer_info.bmiHeader);
+    g_framebuffer_info.bmiHeader.biWidth = g_render_width;
+    g_framebuffer_info.bmiHeader.biHeight = -g_render_height; // Top-down DIB
+    g_framebuffer_info.bmiHeader.biPlanes = 1;
+    g_framebuffer_info.bmiHeader.biBitCount = 32;
+    g_framebuffer_info.bmiHeader.biCompression = BI_RGB;
+
+    HDC hdc = GetDC(g_window_handle);
+    HBITMAP g_framebuffer_bitmap = CreateDIBSection(
+        hdc, &g_framebuffer_info, DIB_RGB_COLORS,
+        &g_framebuffer_memory,
+        NULL, 0
+    );
+    ReleaseDC(g_window_handle, hdc);
+    
+    g_depth_buffer = (float*)malloc(g_render_width * g_render_height * sizeof(float));
 
     scene_init(&g_scene);
 
-    // --- Player-specific logic: Force user to load a scene on startup ---
     OPENFILENAME ofn = {0};
     char szFile[260] = {0};
 
@@ -285,9 +348,39 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 
     if (GetOpenFileName(&ofn) != TRUE || !scene_load_from_file(&g_scene, ofn.lpstrFile)) {
-        // If user cancels or loading fails, exit the application.
         return 0;
     }
+
+    // --- MODIFIED: Search for both spawn point and player model ---
+    for (int i = 0; i < g_scene.object_count; i++) {
+        if (g_scene.objects[i]->is_player_spawn) {
+            mat4_t spawn_transform = mat4_get_world_transform(&g_scene, i);
+            g_player_position.x = spawn_transform.m[0][3];
+            g_player_position.y = spawn_transform.m[1][3];
+            g_player_position.z = spawn_transform.m[2][3];
+            
+            g_player_yaw = g_scene.objects[i]->rotation.z; 
+            g_player_pitch = g_scene.objects[i]->rotation.x;
+            
+            g_player_active = 1;
+        }
+        // Find the player model and store its index
+        if (g_scene.objects[i]->is_player_model) {
+            g_player_model_index = i;
+        }
+    }
+
+    if (!g_player_active) {
+         MessageBox(g_window_handle, "No Player Spawn object found in the scene. The player will not be active.", "Warning", MB_OK | MB_ICONWARNING);
+    } else {
+        ShowCursor(FALSE);
+        POINT screen_center = {g_window_width / 2, g_window_height / 2};
+        ClientToScreen(g_window_handle, &screen_center);
+        SetCursorPos(screen_center.x, screen_center.y);
+    }
+    
+    QueryPerformanceFrequency(&g_perf_counter_freq);
+    QueryPerformanceCounter(&g_last_perf_counter);
 
     int running = 1;
     while (running) {
@@ -297,41 +390,423 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
             TranslateMessage(&message);
             DispatchMessage(&message);
         }
+
+        LARGE_INTEGER current_perf_counter;
+        QueryPerformanceCounter(&current_perf_counter);
+        float dt = (float)(current_perf_counter.QuadPart - g_last_perf_counter.QuadPart) / (float)g_perf_counter_freq.QuadPart;
+        g_last_perf_counter = current_perf_counter;
+        
+        if (dt > 0.1f) dt = 0.1f;
+
+        update_player(dt);
+
         render_frame();
+
         HDC device_context = GetDC(g_window_handle);
-        StretchDIBits(device_context, 0, 0, g_framebuffer_width, g_framebuffer_height, 0, 0, g_framebuffer_width, g_framebuffer_height,
-                      g_framebuffer_memory, &g_framebuffer_info, DIB_RGB_COLORS, SRCCOPY);
+        StretchDIBits(device_context, 
+                      0, 0, g_window_width, g_window_height, 
+                      0, 0, g_render_width, g_render_height, 
+                      g_framebuffer_memory, &g_framebuffer_info, 
+                      DIB_RGB_COLORS, SRCCOPY);
         ReleaseDC(g_window_handle, device_context);
     }
     return 0;
 }
+static int ray_intersects_triangle(vec3_t ro, vec3_t rv, vec3_t v0, vec3_t v1, vec3_t v2, float* d, vec3_t* normal) {
+    const float EPS = 1e-7f;
+    vec3_t e1 = vec3_sub(v1, v0);
+    vec3_t e2 = vec3_sub(v2, v0);
+    
+    vec3_t face_normal = vec3_cross(e1, e2);
+
+    // The original Möller–Trumbore test's 'a' value is effectively this dot product.
+    // We check it directly to determine if we're hitting a backface.
+    float backface_check = vec3_dot(rv, face_normal);
+
+    // If using strict backface culling for physics (not recommended)
+    // if (backface_check >= 0) return 0;
+
+    vec3_t h = vec3_cross(rv, e2);
+    float a = vec3_dot(e1, h);
+
+    // This check is for rays parallel to the triangle plane.
+    if (a > -EPS && a < EPS) return 0;
+
+    float f = 1.f / a;
+    vec3_t s = vec3_sub(ro, v0);
+    float u = f * vec3_dot(s, h);
+    if (u < 0.f || u > 1.f) return 0;
+    vec3_t q = vec3_cross(s, e1);
+    float v = f * vec3_dot(rv, q);
+    if (v < 0.f || u + v > 1.f) return 0;
+    float t = f * vec3_dot(e2, q);
+    if (t > EPS) {
+        if (d) *d = t;
+        if (normal) {
+            // --- NEW LOGIC: Ensure normal always faces the ray origin ---
+            if (backface_check > 0) {
+                // Ray is hitting the back of the triangle, so flip the normal for collision response.
+                *normal = vec3_normalize(vec3_scale(face_normal, -1.0f));
+            } else {
+                *normal = vec3_normalize(face_normal);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+static int raycast_scene(vec3_t ray_origin, vec3_t ray_dir, float max_dist, float* hit_dist, vec3_t* hit_normal) {
+    int hit = 0;
+    float closest_dist = max_dist;
+
+    for (int i = 0; i < g_scene.object_count; i++) {
+        scene_object_t* obj = g_scene.objects[i];
+        if (!obj->mesh || !obj->has_collision) continue;
+
+        mat4_t model_matrix = mat4_get_world_transform(&g_scene, i);
+
+        // This is a broad-phase optimization to quickly discard distant objects.
+        // It's been made more robust to avoid incorrectly culling nearby floors.
+        vec3_t center = { model_matrix.m[0][3], model_matrix.m[1][3], model_matrix.m[2][3] };
+        float max_scale = fmax(obj->scale.x, fmax(obj->scale.y, obj->scale.z));
+        float radius = 1.732f * max_scale; // Radius that encloses a 1x1x1 cube.
+        
+        vec3_t oc = vec3_sub(center, ray_origin);
+        float b = vec3_dot(oc, ray_dir);
+        float c = vec3_dot(oc, oc) - radius * radius;
+        if (c > 0.0f && b < 0.0f) continue; // Sphere is behind and we're moving away
+        float discriminant = b*b - c;
+        if (discriminant < 0.0f) continue; // Ray misses sphere
+
+        // Narrow-phase: Check every triangle in the mesh
+        for (int j = 0; j < obj->mesh->face_count; j++) {
+            int v0i = obj->mesh->faces[j * 3 + 0];
+            int v1i = obj->mesh->faces[j * 3 + 1];
+            int v2i = obj->mesh->faces[j * 3 + 2];
+
+            vec4_t v0w_4 = mat4_mul_vec4(model_matrix, (vec4_t){obj->mesh->vertices[v0i].x, obj->mesh->vertices[v0i].y, obj->mesh->vertices[v0i].z, 1});
+            vec4_t v1w_4 = mat4_mul_vec4(model_matrix, (vec4_t){obj->mesh->vertices[v1i].x, obj->mesh->vertices[v1i].y, obj->mesh->vertices[v1i].z, 1});
+            vec4_t v2w_4 = mat4_mul_vec4(model_matrix, (vec4_t){obj->mesh->vertices[v2i].x, obj->mesh->vertices[v2i].y, obj->mesh->vertices[v2i].z, 1});
+            
+            vec3_t v0 = {v0w_4.x, v0w_4.y, v0w_4.z};
+            vec3_t v1 = {v1w_4.x, v1w_4.y, v1w_4.z};
+            vec3_t v2 = {v2w_4.x, v2w_4.y, v2w_4.z};
+            
+            float dist;
+            vec3_t normal;
+            if (ray_intersects_triangle(ray_origin, ray_dir, v0, v1, v2, &dist, &normal)) {
+                if (dist < closest_dist) {
+                    closest_dist = dist;
+                    if(hit_normal) *hit_normal = normal;
+                    hit = 1;
+                }
+            }
+        }
+    }
+
+    if (hit) {
+        if(hit_dist) *hit_dist = closest_dist;
+    }
+    return hit;
+}
+static vec3_t find_closest_point_on_line_segment(vec3_t p, vec3_t a, vec3_t b) {
+    vec3_t ab = vec3_sub(b, a);
+    float t = vec3_dot(vec3_sub(p, a), ab) / vec3_dot(ab, ab);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return vec3_add(a, vec3_scale(ab, t));
+}
+
+static vec3_t find_closest_point_on_triangle(vec3_t p, vec3_t a, vec3_t b, vec3_t c) {
+    vec3_t ab = vec3_sub(b, a);
+    vec3_t ac = vec3_sub(c, a);
+    vec3_t normal = vec3_cross(ab, ac);
+
+    // Project p onto the triangle's plane
+    vec3_t closest_point = vec3_sub(p, vec3_scale(normal, vec3_dot(vec3_sub(p, a), normal) / vec3_dot(normal, normal)));
+
+    // Check if the projected point is inside the triangle using barycentric coordinates
+    float u, v, w;
+    vec3_t v0 = vec3_sub(b, a), v1 = vec3_sub(c, a), v2 = vec3_sub(closest_point, a);
+    float d00 = vec3_dot(v0, v0), d01 = vec3_dot(v0, v1), d11 = vec3_dot(v1, v1);
+    float d20 = vec3_dot(v2, v0), d21 = vec3_dot(v2, v1);
+    float denom = d00 * d11 - d01 * d01;
+    v = (d11 * d20 - d01 * d21) / denom;
+    w = (d00 * d21 - d01 * d20) / denom;
+    u = 1.0f - v - w;
+
+    if (u >= 0 && v >= 0 && w >= 0) {
+        return closest_point; // The closest point is on the face of the triangle
+    }
+
+    // If not, the closest point is on one of the edges
+    vec3_t p_ab = find_closest_point_on_line_segment(p, a, b);
+    vec3_t p_bc = find_closest_point_on_line_segment(p, b, c);
+    vec3_t p_ca = find_closest_point_on_line_segment(p, c, a);
+
+    float d_ab = vec3_dot(vec3_sub(p, p_ab), vec3_sub(p, p_ab));
+    float d_bc = vec3_dot(vec3_sub(p, p_bc), vec3_sub(p, p_bc));
+    float d_ca = vec3_dot(vec3_sub(p, p_ca), vec3_sub(p, p_ca));
+
+    if (d_ab <= d_bc && d_ab <= d_ca) {
+        return p_ab;
+    } else if (d_bc <= d_ab && d_bc <= d_ca) {
+        return p_bc;
+    } else {
+        return p_ca;
+    }
+}
+static vec3_t resolve_sphere_collision(vec3_t pos, float radius) {
+    vec3_t final_pos = pos;
+    for (int i = 0; i < g_scene.object_count; i++) {
+        scene_object_t* obj = g_scene.objects[i];
+        if (!obj->mesh || !obj->has_collision) continue;
+
+        mat4_t model_matrix = mat4_get_world_transform(&g_scene, i);
+        mat4_t inv_model_matrix = mat4_inverse(model_matrix);
+
+        // Transform sphere center into object's local space
+        vec4_t sphere_center_local_4 = mat4_mul_vec4(inv_model_matrix, (vec4_t){final_pos.x, final_pos.y, final_pos.z, 1.0f});
+        vec3_t sphere_center_local = {sphere_center_local_4.x, sphere_center_local_4.y, sphere_center_local_4.z};
+
+        float scaled_radius = radius / fmax(obj->scale.x, fmax(obj->scale.y, obj->scale.z));
+        float scaled_radius_sq = scaled_radius * scaled_radius;
+
+        for (int j = 0; j < obj->mesh->face_count; j++) {
+            int v0i = obj->mesh->faces[j * 3 + 0];
+            int v1i = obj->mesh->faces[j * 3 + 1];
+            int v2i = obj->mesh->faces[j * 3 + 2];
+
+            vec3_t v0 = obj->mesh->vertices[v0i];
+            vec3_t v1 = obj->mesh->vertices[v1i];
+            vec3_t v2 = obj->mesh->vertices[v2i];
+
+            // Find the closest point on the triangle (face, edges, or vertices) to our sphere
+            vec3_t closest_point_local = find_closest_point_on_triangle(sphere_center_local, v0, v1, v2);
+
+            vec3_t delta = vec3_sub(sphere_center_local, closest_point_local);
+            float dist_sq = vec3_dot(delta, delta);
+
+            // If the distance is less than the radius, we have a collision
+            if (dist_sq < scaled_radius_sq) {
+                float dist = sqrtf(dist_sq);
+                float penetration = scaled_radius - dist;
+                vec3_t push_dir_local = (dist > 1e-6) ? vec3_scale(delta, 1.0f / dist) : vec3_normalize(vec3_sub(v1,v0));
+
+                // Transform the push vector back into world space
+                vec4_t push_dir_world_4 = mat4_mul_vec4(model_matrix, (vec4_t){push_dir_local.x, push_dir_local.y, push_dir_local.z, 0.0f});
+                vec3_t push_dir_world = vec3_normalize((vec3_t){push_dir_world_4.x, push_dir_world_4.y, push_dir_world_4.z});
+                
+                // Push the final position out of the collision
+                final_pos = vec3_add(final_pos, vec3_scale(push_dir_world, penetration));
+
+                // Re-transform the updated position back into local space for the next iteration
+                sphere_center_local_4 = mat4_mul_vec4(inv_model_matrix, (vec4_t){final_pos.x, final_pos.y, final_pos.z, 1.0f});
+                sphere_center_local = (vec3_t){sphere_center_local_4.x, sphere_center_local_4.y, sphere_center_local_4.z};
+            }
+        }
+    }
+    return final_pos;
+}
+void update_player(float dt) {
+    if (!g_player_active) return;
+
+    // --- MOUSE LOOK AND TAB LOGIC (This is unchanged) ---
+    int is_tab_down = (GetKeyState(VK_TAB) & 0x8000) != 0;
+    if (is_tab_down != g_mouse_is_free) {
+        g_mouse_is_free = is_tab_down;
+        ShowCursor(g_mouse_is_free);
+        if (!g_mouse_is_free) {
+            POINT screen_center = {g_window_width / 2, g_window_height / 2};
+            ClientToScreen(g_window_handle, &screen_center);
+            SetCursorPos(screen_center.x, screen_center.y);
+        }
+    }
+
+    if (!g_mouse_is_free) {
+        POINT p;
+        if (GetCursorPos(&p) && ScreenToClient(g_window_handle, &p)) {
+            int center_x = g_window_width / 2;
+            int center_y = g_window_height / 2;
+            float dx = (float)(p.x - center_x);
+            float dy = (float)(p.y - center_y);
+
+            if (dx != 0 || dy != 0) {
+                g_player_yaw -= dx * 0.0015f;
+                g_player_pitch -= dy * 0.0015f;
+
+                if (g_player_pitch > 1.5f) g_player_pitch = 1.5f;
+                if (g_player_pitch < -1.5f) g_player_pitch = -1.5f;
+
+                POINT screen_center = {center_x, center_y};
+                ClientToScreen(g_window_handle, &screen_center);
+                SetCursorPos(screen_center.x, screen_center.y);
+            }
+        }
+    }
+    
+    // --- 1. HORIZONTAL MOVEMENT (X & Y) ---
+    vec3_t move_input = {0};
+    if (GetKeyState('W') & 0x8000) move_input.x += 1.0f;
+    if (GetKeyState('S') & 0x8000) move_input.x -= 1.0f;
+    if (GetKeyState('A') & 0x8000) move_input.y -= 1.0f;
+    if (GetKeyState('D') & 0x8000) move_input.y += 1.0f;
+
+    vec3_t forward_dir = {cosf(g_player_yaw), sinf(g_player_yaw), 0};
+    vec3_t right_dir   = {sinf(g_player_yaw), -cosf(g_player_yaw), 0};
+    vec3_t wish_dir = vec3_normalize(vec3_add(vec3_scale(forward_dir, move_input.x), vec3_scale(right_dir, move_input.y)));
+    
+    g_player_velocity.x = wish_dir.x * PLAYER_SPEED;
+    g_player_velocity.y = wish_dir.y * PLAYER_SPEED;
+
+    g_player_position.x += g_player_velocity.x * dt;
+    g_player_position.y += g_player_velocity.y * dt;
+
+    // Resolve horizontal collisions by checking the capsule (two spheres)
+    vec3_t bottom_sphere_pos = g_player_position;
+    bottom_sphere_pos.z += PLAYER_RADIUS;
+    vec3_t top_sphere_pos = g_player_position;
+    top_sphere_pos.z += PLAYER_HEIGHT - PLAYER_RADIUS;
+    
+    vec3_t resolved_bottom = resolve_sphere_collision(bottom_sphere_pos, PLAYER_RADIUS);
+    vec3_t resolved_top = resolve_sphere_collision(top_sphere_pos, PLAYER_RADIUS);
+
+    // Apply the largest push-out correction from either sphere
+    float push_out_bottom = vec3_length(vec3_sub(resolved_bottom, bottom_sphere_pos));
+    float push_out_top = vec3_length(vec3_sub(resolved_top, top_sphere_pos));
+
+    if (push_out_bottom > push_out_top) {
+        g_player_position.x += resolved_bottom.x - bottom_sphere_pos.x;
+        g_player_position.y += resolved_bottom.y - bottom_sphere_pos.y;
+    } else {
+        g_player_position.x += resolved_top.x - top_sphere_pos.x;
+        g_player_position.y += resolved_top.y - top_sphere_pos.y;
+    }
+
+    // --- 2. VERTICAL MOVEMENT (Z) ---
+    if ((GetKeyState(VK_SPACE) & 0x8000) && g_player_on_ground) {
+        g_player_velocity.z = PLAYER_JUMP_FORCE;
+        g_player_on_ground = 0;
+    }
+
+    if (!g_player_on_ground) {
+        g_player_velocity.z += PLAYER_GRAVITY * dt;
+    }
+    
+    g_player_position.z += g_player_velocity.z * dt;
+    
+    // Reset ground state before checking
+    g_player_on_ground = 0;
+
+    // Check for ground collision (bottom sphere)
+    bottom_sphere_pos = g_player_position;
+    bottom_sphere_pos.z += PLAYER_RADIUS;
+    resolved_bottom = resolve_sphere_collision(bottom_sphere_pos, PLAYER_RADIUS);
+
+    if (resolved_bottom.z > bottom_sphere_pos.z) { // We were pushed UP
+        g_player_position.z += resolved_bottom.z - bottom_sphere_pos.z; // Snap to ground
+        if (g_player_velocity.z < 0) { // Only stop falling if we were moving down
+            g_player_velocity.z = 0;
+            g_player_on_ground = 1;
+        }
+    }
+    
+    // Check for ceiling collision (top sphere)
+    top_sphere_pos = g_player_position;
+    top_sphere_pos.z += PLAYER_HEIGHT - PLAYER_RADIUS;
+    resolved_top = resolve_sphere_collision(top_sphere_pos, PLAYER_RADIUS);
+    
+    if (resolved_top.z < top_sphere_pos.z) { // We were pushed DOWN
+        g_player_position.z += resolved_top.z - top_sphere_pos.z; // Snap to ceiling
+        if (g_player_velocity.z > 0) { // Stop rising if we hit our head
+            g_player_velocity.z = 0;
+        }
+    }
+}
 void render_frame() {
     if (!g_framebuffer_memory) return;
     
-    // MODIFIED: Use the loaded sky color
     uint32_t* pixel = (uint32_t*)g_framebuffer_memory;
-    for (int i = 0; i < g_framebuffer_width * g_framebuffer_height; ++i) {
+    for (int i = 0; i < g_render_width * g_render_height; ++i) {
         *pixel++ = g_sky_color_uint;
         g_depth_buffer[i] = FLT_MAX;
     }
 
-    vec3_t offset;
-    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
-    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
-    offset.z = g_camera_distance * sinf(g_camera_pitch);
-    vec3_t camera_pos = vec3_add(g_camera_target, offset);
+    vec3_t camera_pos;
+    mat4_t view_matrix;
 
-    vec3_t up_vector = {0, 0, 1};
-    if (fabs(sinf(g_camera_pitch)) > 0.999f) {
-        up_vector = (vec3_t){0, 1, 0}; 
+    if (g_player_active) {
+        // --- NEW LOGIC for 3rd Person Camera ---
+        if (g_player_model_index != -1) {
+            scene_object_t* player_model = g_scene.objects[g_player_model_index];
+
+            // Update the model's position and rotation to match the player controller
+            player_model->position = g_player_position;
+            player_model->rotation.z = g_player_yaw; // Sync Yaw with player look direction
+
+            // Calculate the world-space position of the camera target
+            mat4_t player_transform = mat4_get_world_transform(&g_scene, g_player_model_index);
+            vec4_t target_local = {player_model->camera_offset.x, player_model->camera_offset.y, player_model->camera_offset.z, 1.0f};
+            vec4_t target_world_4 = mat4_mul_vec4(player_transform, target_local);
+            vec3_t camera_target = {target_world_4.x, target_world_4.y, target_world_4.z};
+
+            // Calculate camera position based on distance and orientation from the target
+            vec3_t offset;
+            offset.x = g_camera_distance * cosf(g_player_pitch) * cosf(g_player_yaw);
+            offset.y = g_camera_distance * cosf(g_player_pitch) * sinf(g_player_yaw);
+            offset.z = g_camera_distance * sinf(g_player_pitch);
+            
+            // The camera position is offset from the *target*, not the player origin
+            camera_pos = vec3_add(camera_target, vec3_scale(offset, -1.0f));
+            
+            vec3_t up_vector = {0, 0, 1};
+            if (fabs(sinf(g_player_pitch)) > 0.999f) {
+                up_vector = (vec3_t){0, 1, 0};
+            }
+            view_matrix = mat4_look_at(camera_pos, camera_target, up_vector);
+
+        } else { // --- FALLBACK to 1st Person if no model is set ---
+            vec3_t eye_pos = g_player_position;
+            eye_pos.z += PLAYER_EYE_HEIGHT;
+            camera_pos = eye_pos;
+
+            vec3_t look_direction;
+            look_direction.x = cosf(g_player_pitch) * cosf(g_player_yaw);
+            look_direction.y = cosf(g_player_pitch) * sinf(g_player_yaw);
+            look_direction.z = sinf(g_player_pitch);
+            
+            vec3_t camera_target = vec3_add(eye_pos, look_direction);
+            
+            vec3_t up_vector = {0, 0, 1};
+            if (fabs(look_direction.z) > 0.999f) {
+                up_vector = (vec3_t){0, 1, 0};
+            }
+            
+            view_matrix = mat4_look_at(eye_pos, camera_target, up_vector);
+        }
+
+    } else { // Fallback orbital camera if player is not active
+        vec3_t offset;
+        offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+        offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+        offset.z = g_camera_distance * sinf(g_camera_pitch);
+        camera_pos = vec3_add(g_camera_target, offset);
+
+        vec3_t up_vector = {0, 0, 1};
+        if (fabs(sinf(g_camera_pitch)) > 0.999f) {
+            up_vector = (vec3_t){0, 1, 0}; 
+        }
+        view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
     }
-    mat4_t view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
     
-    mat4_t projection_matrix = mat4_perspective(3.14159f / 4.0f, (float)g_framebuffer_width / (float)g_framebuffer_height, 0.1f, 100.0f);
+    mat4_t projection_matrix = mat4_perspective(3.14159f / 2.0f, (float)g_render_width / (float)g_render_height, 0.1f, 100.0f);
     
-    render_grid(view_matrix, projection_matrix);
-    
+    // --- MODIFIED RENDER LOOP ---
     for (int i = 0; i < g_scene.object_count; i++) {
+        // Don't render the spawn point or the player model itself
+        if (g_scene.objects[i]->is_player_spawn || i == g_player_model_index) {
+            continue;
+        }
         render_object(g_scene.objects[i], i, view_matrix, projection_matrix, camera_pos);
     }
 }
@@ -431,92 +906,86 @@ int clip_triangle_against_near_plane(triangle_t* in_tri, triangle_t* out_tri1, t
 void draw_gouraud_triangle(vec4_t p0, vec4_t p1, vec4_t p2, vec3_t c0, vec3_t c1, vec3_t c2) {
     if (p0.w <= 0 || p1.w <= 0 || p2.w <= 0) return;
 
-    // Perspective divide and screen space transform
     float p0w_inv = 1.0f / p0.w; p0.x *= p0w_inv; p0.y *= p0w_inv; p0.z *= p0w_inv;
     float p1w_inv = 1.0f / p1.w; p1.x *= p1w_inv; p1.y *= p1w_inv; p1.z *= p1w_inv;
     float p2w_inv = 1.0f / p2.w; p2.x *= p2w_inv; p2.y *= p2w_inv; p2.z *= p2w_inv;
 
-    p0.x = (p0.x + 1.0f) * 0.5f * g_framebuffer_width; p0.y = (1.0f - p0.y) * 0.5f * g_framebuffer_height;
-    p1.x = (p1.x + 1.0f) * 0.5f * g_framebuffer_width; p1.y = (1.0f - p1.y) * 0.5f * g_framebuffer_height;
-    p2.x = (p2.x + 1.0f) * 0.5f * g_framebuffer_width; p2.y = (1.0f - p2.y) * 0.5f * g_framebuffer_height;
+    p0.x = (p0.x + 1.0f) * 0.5f * g_render_width; p0.y = (1.0f - p0.y) * 0.5f * g_render_height; // MODIFIED
+    p1.x = (p1.x + 1.0f) * 0.5f * g_render_width; p1.y = (1.0f - p1.y) * 0.5f * g_render_height; // MODIFIED
+    p2.x = (p2.x + 1.0f) * 0.5f * g_render_width; p2.y = (1.0f - p2.y) * 0.5f * g_render_height; // MODIFIED
 
-    // Pre-calculate colors divided by w for perspective-correct interpolation
     vec3_t c0_pw = vec3_scale(c0, p0w_inv);
     vec3_t c1_pw = vec3_scale(c1, p1w_inv);
     vec3_t c2_pw = vec3_scale(c2, p2w_inv);
 
-    // Sort vertices by Y coordinate
     if (p0.y > p1.y) { vec4_t tp = p0; p0 = p1; p1 = tp; vec3_t tc = c0_pw; c0_pw = c1_pw; c1_pw = tc; float tw = p0w_inv; p0w_inv = p1w_inv; p1w_inv = tw; }
     if (p0.y > p2.y) { vec4_t tp = p0; p0 = p2; p2 = tp; vec3_t tc = c0_pw; c0_pw = c2_pw; c2_pw = tc; float tw = p0w_inv; p0w_inv = p2w_inv; p2w_inv = tw; }
     if (p1.y > p2.y) { vec4_t tp = p1; p1 = p2; p2 = tp; vec3_t tc = c1_pw; c1_pw = c2_pw; c2_pw = tc; float tw = p1w_inv; p1w_inv = p2w_inv; p2w_inv = tw; }
 
-    int y_start = (int)ceil(p0.y - 0.5f);
-    int y_end = (int)ceil(p2.y - 0.5f);
+    int y_start = (int)(p0.y + 0.5f);
+    int y_end = (int)(p2.y + 0.5f);
+
+    y_start = (y_start < 0) ? 0 : y_start;
+    y_end = (y_end > g_render_height) ? g_render_height : y_end; // MODIFIED
 
     float dy_total = p2.y - p0.y;
     float dy_split = p1.y - p0.y;
 
     for (int y = y_start; y < y_end; y++) {
-        if (y < 0 || y >= g_framebuffer_height) continue;
-
         float factor1 = (dy_total > 0) ? ((float)y - p0.y) / dy_total : 0;
-        float factor2;
-        if (y < p1.y) {
-            factor2 = (dy_split > 0) ? ((float)y - p0.y) / dy_split : 0;
-        } else {
-            factor2 = (p2.y - p1.y > 0) ? ((float)y - p1.y) / (p2.y - p1.y) : 0;
-        }
+        float factor2 = (y < p1.y) 
+            ? ((dy_split > 0) ? ((float)y - p0.y) / dy_split : 0)
+            : ((p2.y - p1.y > 0) ? ((float)y - p1.y) / (p2.y - p1.y) : 0);
 
-        int xa = (int)(p0.x + factor1 * (p2.x - p0.x));
+        float xa_f = p0.x + factor1 * (p2.x - p0.x);
         float wa_inv = p0w_inv + factor1 * (p2w_inv - p0w_inv);
         vec3_t ca_pw = vec3_add(c0_pw, vec3_scale(vec3_sub(c2_pw, c0_pw), factor1));
 
-        int xb;
-        float wb_inv;
-        vec3_t cb_pw;
+        float xb_f = (y < p1.y) ? (p0.x + factor2 * (p1.x - p0.x)) : (p1.x + factor2 * (p2.x - p1.x));
+        float wb_inv = (y < p1.y) ? (p0w_inv + factor2 * (p1w_inv - p0w_inv)) : (p1w_inv + factor2 * (p2w_inv - p1w_inv));
+        vec3_t cb_pw = (y < p1.y) ? vec3_add(c0_pw, vec3_scale(vec3_sub(c1_pw, c0_pw), factor2)) : vec3_add(c1_pw, vec3_scale(vec3_sub(c2_pw, c1_pw), factor2));
 
-        if (y < p1.y) {
-            xb = (int)(p0.x + factor2 * (p1.x - p0.x));
-            wb_inv = p0w_inv + factor2 * (p1w_inv - p0w_inv);
-            cb_pw = vec3_add(c0_pw, vec3_scale(vec3_sub(c1_pw, c0_pw), factor2));
-        } else {
-            xb = (int)(p1.x + factor2 * (p2.x - p1.x));
-            wb_inv = p1w_inv + factor2 * (p2w_inv - p1w_inv);
-            cb_pw = vec3_add(c1_pw, vec3_scale(vec3_sub(c2_pw, c1_pw), factor2));
-        }
-
-        if (xa > xb) { 
-            int temp_x = xa; xa = xb; xb = temp_x;
+        if (xa_f > xb_f) { 
+            float temp_x = xa_f; xa_f = xb_f; xb_f = temp_x;
             float temp_w = wa_inv; wa_inv = wb_inv; wb_inv = temp_w;
             vec3_t temp_c = ca_pw; ca_pw = cb_pw; cb_pw = temp_c;
         }
 
-        // --- OPTIMIZATION: Incremental Scanline Interpolation ---
-        float scanline_width = (float)(xb - xa);
-        if (scanline_width < 1) continue;
+        int x_start = (int)(xa_f + 0.5f);
+        int x_end = (int)(xb_f + 0.5f);
 
-        float w_step = (wb_inv - wa_inv) / scanline_width;
-        vec3_t c_step = vec3_scale(vec3_sub(cb_pw, ca_pw), 1.0f / scanline_width);
+        x_start = (x_start < 0) ? 0 : x_start;
+        x_end = (x_end > g_render_width) ? g_render_width : x_end; // MODIFIED
 
-        float current_w_inv = wa_inv;
-        vec3_t current_c_pw = ca_pw;
+        float scanline_width = xb_f - xa_f;
+        if (scanline_width <= 0) continue;
 
-        for (int x = xa; x < xb; x++) {
-            if (x >= 0 && x < g_framebuffer_width) {
-                if (current_w_inv > 0) {
-                    float z = 1.0f / current_w_inv;
+        vec3_t c_pw_step = vec3_scale(vec3_sub(cb_pw, ca_pw), 1.0f / scanline_width);
+        float w_inv_step = (wb_inv - wa_inv) / scanline_width;
+
+        float initial_offset = (float)x_start - xa_f;
+        vec3_t current_c_pw = vec3_add(ca_pw, vec3_scale(c_pw_step, initial_offset));
+        float current_w_inv = wa_inv + w_inv_step * initial_offset;
+        
+        uint32_t* row = (uint32_t*)g_framebuffer_memory + y * g_render_width; // MODIFIED
+        float* depth_row = g_depth_buffer + y * g_render_width; // MODIFIED
+
+        for (int x = x_start; x < x_end; x++) {
+            if (current_w_inv > 0) {
+                float z = 1.0f / current_w_inv;
+                if (z < depth_row[x]) {
                     vec3_t final_color = vec3_scale(current_c_pw, z);
 
                     uint8_t r = (uint8_t)(fmin(1.0f, final_color.x) * 255.0f);
                     uint8_t g = (uint8_t)(fmin(1.0f, final_color.y) * 255.0f);
                     uint8_t b = (uint8_t)(fmin(1.0f, final_color.z) * 255.0f);
                     
-                    draw_pixel(x, y, z, (r << 16) | (g << 8) | b);
+                    row[x] = (r << 16) | (g << 8) | b;
+                    depth_row[x] = z;
                 }
             }
-            // Increment for the next pixel
-            current_w_inv += w_step;
-            current_c_pw = vec3_add(current_c_pw, c_step);
+            current_c_pw = vec3_add(current_c_pw, c_pw_step);
+            current_w_inv += w_inv_step;
         }
     }
 }
@@ -525,21 +994,23 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
         return;
     }
     
+    // --- NEW: Resize global buffers if necessary ---
+    if (object->mesh->vertex_count > g_vertex_buffer_capacity) {
+        g_vertex_buffer_capacity = object->mesh->vertex_count;
+        g_clip_coords_buffer = (vec4_t*)realloc(g_clip_coords_buffer, g_vertex_buffer_capacity * sizeof(vec4_t));
+        g_colors_buffer = (vec3_t*)realloc(g_colors_buffer, g_vertex_buffer_capacity * sizeof(vec3_t));
+        if (!g_clip_coords_buffer || !g_colors_buffer) {
+             g_vertex_buffer_capacity = 0; // Reset on failure
+             return;
+        }
+    }
+
     mat4_t model_matrix = mat4_get_world_transform(&g_scene, object_index);
     mat4_t final_transform = mat4_mul_mat4(projection_matrix, mat4_mul_mat4(view_matrix, model_matrix));
 
-    // --- Pre-calculate all vertex data ---
-    vec4_t* clip_coords = (vec4_t*)malloc(object->mesh->vertex_count * sizeof(vec4_t));
-    vec3_t* lit_colors = (vec3_t*)malloc(object->mesh->vertex_count * sizeof(vec3_t));
-    if (!clip_coords || !lit_colors) {
-        if (clip_coords) free(clip_coords);
-        if (lit_colors) free(lit_colors);
-        return;
-    }
-
     for (int i = 0; i < object->mesh->vertex_count; i++) {
         // Transform vertex position to clip space
-        clip_coords[i] = mat4_mul_vec4(final_transform, (vec4_t){
+        g_clip_coords_buffer[i] = mat4_mul_vec4(final_transform, (vec4_t){
             object->mesh->vertices[i].x, 
             object->mesh->vertices[i].y, 
             object->mesh->vertices[i].z, 
@@ -601,9 +1072,9 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
                 }
             }
         }
-        lit_colors[i].x = object->material.diffuse_color.x * diffuse_sum.x + specular_sum.x;
-        lit_colors[i].y = object->material.diffuse_color.y * diffuse_sum.y + specular_sum.y;
-        lit_colors[i].z = object->material.diffuse_color.z * diffuse_sum.z + specular_sum.z;
+        g_colors_buffer[i].x = object->material.diffuse_color.x * diffuse_sum.x + specular_sum.x;
+        g_colors_buffer[i].y = object->material.diffuse_color.y * diffuse_sum.y + specular_sum.y;
+        g_colors_buffer[i].z = object->material.diffuse_color.z * diffuse_sum.z + specular_sum.z;
     }
 
     // --- Render faces using pre-calculated data ---
@@ -611,9 +1082,9 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
         int v_indices[3] = {object->mesh->faces[i*3+0], object->mesh->faces[i*3+1], object->mesh->faces[i*3+2]};
         
         // --- Backface Culling ---
-        vec4_t v0_clip = clip_coords[v_indices[0]];
-        vec4_t v1_clip = clip_coords[v_indices[1]];
-        vec4_t v2_clip = clip_coords[v_indices[2]];
+        vec4_t v0_clip = g_clip_coords_buffer[v_indices[0]];
+        vec4_t v1_clip = g_clip_coords_buffer[v_indices[1]];
+        vec4_t v2_clip = g_clip_coords_buffer[v_indices[2]];
         
         if (v0_clip.w > 0 && v1_clip.w > 0 && v2_clip.w > 0) {
              vec3_t v0_ndc = {v0_clip.x/v0_clip.w, v0_clip.y/v0_clip.w, v0_clip.z/v0_clip.w};
@@ -630,9 +1101,9 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
         original_tri.vertices[0] = v0_clip;
         original_tri.vertices[1] = v1_clip;
         original_tri.vertices[2] = v2_clip;
-        original_tri.colors[0] = lit_colors[v_indices[0]];
-        original_tri.colors[1] = lit_colors[v_indices[1]];
-        original_tri.colors[2] = lit_colors[v_indices[2]];
+        original_tri.colors[0] = g_colors_buffer[v_indices[0]];
+        original_tri.colors[1] = g_colors_buffer[v_indices[1]];
+        original_tri.colors[2] = g_colors_buffer[v_indices[2]];
 
         // --- Clip and Draw ---
         triangle_t clipped_tris[2];
@@ -645,9 +1116,6 @@ void render_object(scene_object_t* object, int object_index, mat4_t view_matrix,
             );
         }
     }
-
-    free(clip_coords);
-    free(lit_colors);
 }
 void render_grid(mat4_t view_matrix, mat4_t projection_matrix) {
     int grid_size = 10; float half_size = grid_size/2.0f;
@@ -663,7 +1131,7 @@ void render_grid(mat4_t view_matrix, mat4_t projection_matrix) {
         vec4_t p3 = {-half_size, i, 0, 1}, p4 = {half_size, i, 0, 1};
         
         vec4_t sp[4] = {mat4_mul_vec4(vp_matrix,p1), mat4_mul_vec4(vp_matrix,p2), mat4_mul_vec4(vp_matrix,p3), mat4_mul_vec4(vp_matrix,p4)};
-        for(int j=0;j<4;++j){if(sp[j].w!=0){sp[j].x=(sp[j].x/sp[j].w+1)*0.5f*g_framebuffer_width; sp[j].y=(1-sp[j].y/sp[j].w)*0.5f*g_framebuffer_height; sp[j].z=sp[j].z/sp[j].w;}}
+        for(int j=0;j<4;++j){if(sp[j].w!=0){sp[j].x=(sp[j].x/sp[j].w+1)*0.5f*g_render_width; sp[j].y=(1-sp[j].y/sp[j].w)*0.5f*g_render_height; sp[j].z=sp[j].z/sp[j].w;}}
         draw_line(sp[0].x,sp[0].y,sp[0].z, sp[1].x,sp[1].y,sp[1].z, grid_color);
         draw_line(sp[2].x,sp[2].y,sp[2].z, sp[3].x,sp[3].y,sp[3].z, grid_color);
     }
@@ -674,14 +1142,23 @@ void render_grid(mat4_t view_matrix, mat4_t projection_matrix) {
     vec4_t z1={0,0,-half_size,1}, z2={0,0,half_size,1}; // Z-axis
 
     vec4_t axis_p[6] = {mat4_mul_vec4(vp_matrix,x1), mat4_mul_vec4(vp_matrix,x2), mat4_mul_vec4(vp_matrix,y1), mat4_mul_vec4(vp_matrix,y2), mat4_mul_vec4(vp_matrix,z1), mat4_mul_vec4(vp_matrix,z2)};
-    for(int j=0;j<6;++j){if(axis_p[j].w!=0){axis_p[j].x=(axis_p[j].x/axis_p[j].w+1)*0.5f*g_framebuffer_width; axis_p[j].y=(1-axis_p[j].y/axis_p[j].w)*0.5f*g_framebuffer_height; axis_p[j].z=axis_p[j].z/axis_p[j].w;}}
+    // --- FIX: The typo is on this line ---
+    for(int j=0;j<6;++j){if(axis_p[j].w!=0){axis_p[j].x=(axis_p[j].x/axis_p[j].w+1)*0.5f*g_render_width; axis_p[j].y=(1-axis_p[j].y/axis_p[j].w)*0.5f*g_render_height; axis_p[j].z=axis_p[j].z/axis_p[j].w;}} // Changed sp[j].w to axis_p[j].w
     
     draw_line(axis_p[0].x,axis_p[0].y,axis_p[0].z, axis_p[1].x,axis_p[1].y,axis_p[1].z, axis_color_x); // Red X
     draw_line(axis_p[2].x,axis_p[2].y,axis_p[2].z, axis_p[3].x,axis_p[3].y,axis_p[3].z, axis_color_y); // Green Y
     draw_line(axis_p[4].x,axis_p[4].y,axis_p[4].z, axis_p[5].x,axis_p[5].y,axis_p[5].z, axis_color_z); // Blue Z
 }
 // --- Drawing Helper Functions ---
-void draw_pixel(int x,int y,float z,uint32_t c){if(x>=0&&x<g_framebuffer_width&&y>=0&&y<g_framebuffer_height){int i=x+y*g_framebuffer_width;if(z<g_depth_buffer[i]){*((uint32_t*)g_framebuffer_memory+i)=c;g_depth_buffer[i]=z;}}}
+void draw_pixel(int x, int y, float z, uint32_t c) {
+    if (x >= 0 && x < g_render_width && y >= 0 && y < g_render_height) { // MODIFIED
+        int i = x + y * g_render_width; // MODIFIED
+        if (z < g_depth_buffer[i]) {
+            *((uint32_t*)g_framebuffer_memory + i) = c;
+            g_depth_buffer[i] = z;
+        }
+    }
+}
 void draw_line(int x0,int y0,float z0,int x1,int y1,float z1,uint32_t c){int dx=abs(x1-x0),sx=x0<x1?1:-1,dy=-abs(y1-y0),sy=y0<y1?1:-1,err=dx+dy,e2;float z=z0,dz=(z1-z0)/sqrtf((float)(x1-x0)*(x1-x0)+(y1-y0)*(y1-y0));for(;;){draw_pixel(x0,y0,z,c);if(x0==x1&&y0==y1)break;e2=2*err;if(e2>=dy){err+=dy;x0+=sx;z+=dz*sx;}if(e2<=dx){err+=dx;y0+=sy;z+=dz*sy;}}}
 
 LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -689,34 +1166,16 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
     switch (message) {
         case WM_CLOSE: case WM_DESTROY: {
             scene_destroy(&g_scene);
+            if (g_clip_coords_buffer) free(g_clip_coords_buffer);
+            if (g_colors_buffer) free(g_colors_buffer);
+            if (g_depth_buffer) free(g_depth_buffer); // Free depth buffer on exit
+            // g_framebuffer_memory is freed by DeleteObject on the HBITMAP
             PostQuitMessage(0);
         } break;
         case WM_SIZE: {
-            g_framebuffer_width = LOWORD(l_param); g_framebuffer_height = HIWORD(l_param);
-            
-            // --- MODIFIED: Use CreateDIBSection for a more robust framebuffer ---
-            HBITMAP g_framebuffer_bitmap; // This can be local as we only need it to draw
-            if (g_framebuffer_bitmap) DeleteObject(g_framebuffer_bitmap);
-            if (g_depth_buffer) free(g_depth_buffer);
-
-            g_framebuffer_info.bmiHeader.biSize = sizeof(g_framebuffer_info.bmiHeader);
-            g_framebuffer_info.bmiHeader.biWidth = g_framebuffer_width;
-            g_framebuffer_info.bmiHeader.biHeight = -g_framebuffer_height; // Top-down DIB
-            g_framebuffer_info.bmiHeader.biPlanes = 1;
-            g_framebuffer_info.bmiHeader.biBitCount = 32;
-            g_framebuffer_info.bmiHeader.biCompression = BI_RGB;
-
-            HDC hdc = GetDC(window_handle);
-            g_framebuffer_bitmap = CreateDIBSection(
-                hdc, &g_framebuffer_info, DIB_RGB_COLORS,
-                &g_framebuffer_memory,
-                NULL, 0
-            );
-            ReleaseDC(window_handle, hdc);
-            
-            g_depth_buffer = (float*)malloc(g_framebuffer_width * g_framebuffer_height * sizeof(float));
-            // --- END MODIFICATION ---
-
+            // --- MODIFIED: Only update window dimensions. Don't touch the framebuffer. ---
+            g_window_width = LOWORD(l_param); 
+            g_window_height = HIWORD(l_param);
         } break;
         case WM_MBUTTONDOWN: {
             g_middle_mouse_down = 1;
@@ -737,24 +1196,25 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
         case WM_MOUSEMOVE: {
             int cur_x = LOWORD(l_param), cur_y = HIWORD(l_param);
             int dx = cur_x - g_last_mouse_x, dy = cur_y - g_last_mouse_y;
-            if (g_middle_mouse_down && (GetKeyState(VK_SHIFT) & 0x8000)) {
-                // --- MODIFIED: Z-Up Panning Logic ---
-                float sens = 0.0025f * g_camera_distance;
-                vec3_t offset;
-                offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
-                offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
-                offset.z = g_camera_distance * sinf(g_camera_pitch);
-                vec3_t cam_pos = vec3_add(g_camera_target, offset); 
-                vec3_t fwd = vec3_normalize(vec3_sub(g_camera_target, cam_pos)); 
-                vec3_t right = vec3_normalize(vec3_cross(fwd, (vec3_t){0,0,1})); 
-                vec3_t up = vec3_normalize(vec3_cross(right, fwd));
-                g_camera_target = vec3_add(g_camera_target, vec3_add(vec3_scale(right, -dx * sens), vec3_scale(up, dy * sens)));
-                // --- END MODIFICATION ---
-            } else if (g_middle_mouse_down) {
-                g_camera_yaw += (float)dx * 0.01f;
-                g_camera_pitch += (float)dy * 0.01f;
-                if (g_camera_pitch > 1.5f) g_camera_pitch = 1.5f;
-                if (g_camera_pitch < -1.5f) g_camera_pitch = -1.5f;
+            // This orbital camera logic is only a fallback if player is not active
+            if (!g_player_active && g_middle_mouse_down) {
+                 if (GetKeyState(VK_SHIFT) & 0x8000) {
+                    float sens = 0.0025f * g_camera_distance;
+                    vec3_t offset;
+                    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                    offset.z = g_camera_distance * sinf(g_camera_pitch);
+                    vec3_t cam_pos = vec3_add(g_camera_target, offset); 
+                    vec3_t fwd = vec3_normalize(vec3_sub(g_camera_target, cam_pos)); 
+                    vec3_t right = vec3_normalize(vec3_cross(fwd, (vec3_t){0,0,1})); 
+                    vec3_t up = vec3_normalize(vec3_cross(right, fwd));
+                    g_camera_target = vec3_add(g_camera_target, vec3_add(vec3_scale(right, -dx * sens), vec3_scale(up, dy * sens)));
+                } else {
+                    g_camera_yaw += (float)dx * 0.01f;
+                    g_camera_pitch += (float)dy * 0.01f;
+                    if (g_camera_pitch > 1.5f) g_camera_pitch = 1.5f;
+                    if (g_camera_pitch < -1.5f) g_camera_pitch = -1.5f;
+                }
             }
             g_last_mouse_x = cur_x;
             g_last_mouse_y = cur_y;

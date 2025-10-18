@@ -289,3 +289,6 @@ vec3_t vec3_scale(vec3_t v, float s) {
     return result;
 }
 
+float vec3_length(vec3_t v) {
+    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+}

@@ -51,6 +51,10 @@ typedef struct {
     RECT ui_outliner_rect; // The clickable screen-space rect for this object in the outliner
     int is_double_sided; // 0 = Backface Culling (Default), 1 = Render both sides
     int is_static;      // 0 = Dynamic (Default), 1 = Cannot be transformed in Scene Mode
+    int is_player_spawn; // 0 = No (Default), 1 = Yes
+    int has_collision;   // 0 = No (pass-through), 1 = Yes (solid)
+    int is_player_model; // 0 = No (Default), 1 = Yes
+    vec3_t camera_offset; // Point of interest for the camera, relative to the object's origin
 } scene_object_t;
 
 typedef struct {
@@ -66,6 +70,7 @@ float vec3_dot(vec3_t a, vec3_t b);
 vec3_t vec3_normalize(vec3_t v);
 vec3_t vec3_add(vec3_t a, vec3_t b);
 vec3_t vec3_scale(vec3_t v, float s);
+float vec3_length(vec3_t v);
 // --- Matrix Functions ---
 mat4_t mat4_identity(void);
 mat4_t mat4_perspective(float fov_y, float aspect_ratio, float near_plane, float far_plane);
