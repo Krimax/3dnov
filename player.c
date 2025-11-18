@@ -13,7 +13,25 @@ typedef struct {
     vec4_t vertices[3];
     vec3_t colors[3];
 } triangle_t;
+typedef enum {
+    GAME_RUNNING,
+    GAME_PAUSED
+} game_state_t;
 
+typedef struct {
+    float fov_degrees;
+    float mouse_sensitivity;
+} player_config_t;
+
+// --- Global Variables ---
+static game_state_t g_game_state = GAME_RUNNING;
+static player_config_t g_player_config;
+
+// --- Pause Menu UI Rects ---
+static RECT g_resume_button_rect;
+static RECT g_exit_button_rect;
+static RECT g_fov_minus_rect, g_fov_plus_rect;
+static RECT g_sens_minus_rect, g_sens_plus_rect;
 // --- Global Variables ---
 static HWND g_window_handle;
 static BITMAPINFO g_framebuffer_info;
@@ -47,13 +65,22 @@ static int g_player_on_ground = 0;          // Is the player currently standing 
 static int g_player_active = 0;             // Is the player logic running? (Set after finding spawn)
 static int g_mouse_is_free = 0;             // 0 = Locked for FPS control, 1 = Free
 static int g_player_model_index = -1;       // Index of the object used as the player model
+static vec3_t g_last_player_position = {FLT_MAX, FLT_MAX, FLT_MAX};
+static float g_last_player_yaw = FLT_MAX;
+static float g_last_player_pitch = FLT_MAX;
 
-#define PLAYER_HEIGHT 1.8f
-#define PLAYER_EYE_HEIGHT 1.6f
-#define PLAYER_RADIUS 0.1f
+#define PLAYER_HEIGHT 1.5f
+#define PLAYER_EYE_HEIGHT 1.3f
+#define PLAYER_RADIUS 0.3f
 #define PLAYER_SPEED 5.0f
 #define PLAYER_GRAVITY -18.0f
-#define PLAYER_JUMP_FORCE 8.0f
+#define PLAYER_JUMP_FORCE 7.0f
+
+// New physics constants
+#define PLAYER_ACCELERATION 50.0f
+#define PLAYER_AIR_ACCELERATION 5.0f
+#define PLAYER_FRICTION 12.0f
+
 static vec4_t* g_clip_coords_buffer = NULL;
 static vec3_t* g_colors_buffer = NULL;
 static int g_vertex_buffer_capacity = 0;
@@ -147,6 +174,118 @@ void scene_destroy(scene_t* scene) {
     scene->object_count = 0;
     scene->capacity = 0;
 }
+void save_config(const player_config_t* config) {
+    FILE* file = fopen("player_config.dat", "wb");
+    if (file) {
+        fwrite(config, sizeof(player_config_t), 1, file);
+        fclose(file);
+    }
+}
+void load_config(player_config_t* config) {
+    FILE* file = fopen("player_config.dat", "rb");
+    if (file) {
+        fread(config, sizeof(player_config_t), 1, file);
+        fclose(file);
+    } else {
+        // Set default values if the config file doesn't exist
+        config->fov_degrees = 90.0f;
+        config->mouse_sensitivity = 0.0015f;
+        save_config(config); // Create the file with default values
+    }
+}
+void draw_pause_menu(HDC hdc) {
+    // --- Draw Semi-Transparent Background ---
+    HBRUSH hBrush = CreateSolidBrush(0x00000000); // Black brush
+    HDC hdcMem = CreateCompatibleDC(hdc);
+    HBITMAP hbmMem = CreateCompatibleBitmap(hdc, g_render_width, g_render_height);
+    HANDLE hOld = SelectObject(hdcMem, hbmMem);
+
+    BitBlt(hdcMem, 0, 0, g_render_width, g_render_height, hdc, 0, 0, SRCCOPY);
+    RECT panel_rect = { 0, 0, g_render_width, g_render_height };
+    FillRect(hdcMem, &panel_rect, hBrush);
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 128, 0 }; // 50% opacity
+    AlphaBlend(hdc, 0, 0, g_render_width, g_render_height, hdcMem, 0, 0, g_render_width, g_render_height, bf);
+    
+    SelectObject(hdcMem, hOld);
+    DeleteObject(hbmMem);
+    DeleteDC(hdcMem);
+    DeleteObject(hBrush);
+
+    // --- Draw UI Elements ---
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, 0x00FFFFFF); // White text
+    HFONT hFont = CreateFont(32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, TEXT("Arial"));
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+    int center_x = g_render_width / 2;
+    int y_pos = g_render_height / 2 - 150;
+    char buffer[128];
+    SIZE text_size;
+
+    // --- FOV Setting ---
+    sprintf_s(buffer, sizeof(buffer), "Field of View: %.0f", g_player_config.fov_degrees);
+    GetTextExtentPoint32(hdc, buffer, strlen(buffer), &text_size);
+    TextOut(hdc, center_x - text_size.cx / 2, y_pos, buffer, strlen(buffer));
+
+    GetTextExtentPoint32(hdc, "-", 1, &text_size);
+    g_fov_minus_rect.left = center_x - 150 - text_size.cx / 2;
+    g_fov_minus_rect.right = g_fov_minus_rect.left + text_size.cx;
+    g_fov_minus_rect.top = y_pos;
+    g_fov_minus_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_fov_minus_rect.left, g_fov_minus_rect.top, "-", 1);
+
+    GetTextExtentPoint32(hdc, "+", 1, &text_size);
+    g_fov_plus_rect.left = center_x + 150 - text_size.cx / 2;
+    g_fov_plus_rect.right = g_fov_plus_rect.left + text_size.cx;
+    g_fov_plus_rect.top = y_pos;
+    g_fov_plus_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_fov_plus_rect.left, g_fov_plus_rect.top, "+", 1);
+    
+    y_pos += 60;
+
+    // --- Mouse Sensitivity Setting ---
+    sprintf_s(buffer, sizeof(buffer), "Sensitivity: %.4f", g_player_config.mouse_sensitivity);
+    GetTextExtentPoint32(hdc, buffer, strlen(buffer), &text_size);
+    TextOut(hdc, center_x - text_size.cx / 2, y_pos, buffer, strlen(buffer));
+
+    GetTextExtentPoint32(hdc, "-", 1, &text_size);
+    g_sens_minus_rect.left = center_x - 150 - text_size.cx / 2;
+    g_sens_minus_rect.right = g_sens_minus_rect.left + text_size.cx;
+    g_sens_minus_rect.top = y_pos;
+    g_sens_minus_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_sens_minus_rect.left, g_sens_minus_rect.top, "-", 1);
+
+    GetTextExtentPoint32(hdc, "+", 1, &text_size);
+    g_sens_plus_rect.left = center_x + 150 - text_size.cx / 2;
+    g_sens_plus_rect.right = g_sens_plus_rect.left + text_size.cx;
+    g_sens_plus_rect.top = y_pos;
+    g_sens_plus_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_sens_plus_rect.left, g_sens_plus_rect.top, "+", 1);
+    
+    y_pos += 100;
+
+    const char* resume_text = "Resume";
+    GetTextExtentPoint32(hdc, resume_text, strlen(resume_text), &text_size);
+    g_resume_button_rect.left = center_x - text_size.cx / 2;
+    g_resume_button_rect.right = g_resume_button_rect.left + text_size.cx;
+    g_resume_button_rect.top = y_pos;
+    g_resume_button_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_resume_button_rect.left, g_resume_button_rect.top, resume_text, strlen(resume_text));
+
+    y_pos += 60;
+    
+    const char* exit_text = "Exit";
+    GetTextExtentPoint32(hdc, exit_text, strlen(exit_text), &text_size);
+    g_exit_button_rect.left = center_x - text_size.cx / 2;
+    g_exit_button_rect.right = g_exit_button_rect.left + text_size.cx;
+    g_exit_button_rect.top = y_pos;
+    g_exit_button_rect.bottom = y_pos + text_size.cy;
+    TextOut(hdc, g_exit_button_rect.left, g_exit_button_rect.top, exit_text, strlen(exit_text));
+
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hFont);
+}
 int scene_load_from_file(scene_t* scene, const char* filename) {
     if (!scene || !filename) return 0;
 
@@ -158,6 +297,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     char header[4];
     fread(header, sizeof(char), 4, file);
 
+    int is_scn4_format = (strncmp(header, "SCN4", 4) == 0);
     int is_scn3_format = (strncmp(header, "SCN3", 4) == 0);
     int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
     int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
@@ -165,7 +305,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     vec3_t sky_color_vec;
     int object_count = 0;
 
-    if (is_scn3_format || is_scn2_format) {
+    if (is_scn4_format || is_scn3_format || is_scn2_format) {
         fread(&sky_color_vec, sizeof(vec3_t), 1, file);
         fread(&object_count, sizeof(int), 1, file);
     } else if (is_scn1_format) {
@@ -198,11 +338,15 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         new_obj->child_capacity = 4;
         new_obj->children = (int*)malloc(new_obj->child_capacity * sizeof(int));
 
+        if (is_scn4_format) {
+            fread(new_obj->name, sizeof(char), 64, file); // Read the name, even though we don't use it in the player
+        }
+
         fread(&new_obj->position, sizeof(vec3_t), 1, file);
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
 
-        if (is_scn3_format || is_scn2_format) {
+        if (is_scn4_format || is_scn3_format || is_scn2_format) {
             fread(&new_obj->material, sizeof(material_t), 1, file);
         } else { 
             vec3_t old_color;
@@ -212,7 +356,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->material.shininess = 32.0f;
         }
 
-        if (is_scn3_format) {
+        if (is_scn4_format || is_scn3_format) {
             fread(&new_obj->parent_index, sizeof(int), 1, file);
             fread(&new_obj->is_double_sided, sizeof(int), 1, file);
             fread(&new_obj->is_static, sizeof(int), 1, file);
@@ -247,7 +391,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         }
 
         int is_light = 0;
-        if (is_scn3_format || is_scn2_format || is_scn1_format) {
+        if (is_scn4_format || is_scn3_format || is_scn2_format || is_scn1_format) {
             fread(&is_light, sizeof(int), 1, file);
         }
 
@@ -297,8 +441,19 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     fclose(file);
     return 1;
 }
+
+void setup_debug_console(void) {
+    if (AllocConsole()) {
+        FILE* f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        SetConsoleTitle("Debug Console");
+        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+        printf("Debug Console Initialized.\n");
+    }
+}
 // --- Main Entry Point ---
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, int cmd_show) {
+	setup_debug_console(); 
     WNDCLASS window_class = {0};
     window_class.style = CS_HREDRAW | CS_VREDRAW;
     window_class.lpfnWndProc = window_callback;
@@ -335,6 +490,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     g_depth_buffer = (float*)malloc(g_render_width * g_render_height * sizeof(float));
 
     scene_init(&g_scene);
+    load_config(&g_player_config); // Load settings at startup
 
     OPENFILENAME ofn = {0};
     char szFile[260] = {0};
@@ -351,7 +507,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         return 0;
     }
 
-    // --- MODIFIED: Search for both spawn point and player model ---
     for (int i = 0; i < g_scene.object_count; i++) {
         if (g_scene.objects[i]->is_player_spawn) {
             mat4_t spawn_transform = mat4_get_world_transform(&g_scene, i);
@@ -364,7 +519,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
             
             g_player_active = 1;
         }
-        // Find the player model and store its index
         if (g_scene.objects[i]->is_player_model) {
             g_player_model_index = i;
         }
@@ -373,6 +527,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     if (!g_player_active) {
          MessageBox(g_window_handle, "No Player Spawn object found in the scene. The player will not be active.", "Warning", MB_OK | MB_ICONWARNING);
     } else {
+        g_game_state = GAME_RUNNING;
         ShowCursor(FALSE);
         POINT screen_center = {g_window_width / 2, g_window_height / 2};
         ClientToScreen(g_window_handle, &screen_center);
@@ -403,11 +558,22 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         render_frame();
 
         HDC device_context = GetDC(g_window_handle);
+
+        HDC memory_dc = CreateCompatibleDC(device_context);
+        HBITMAP old_bitmap = (HBITMAP)SelectObject(memory_dc, g_framebuffer_bitmap);
+
+        if (g_game_state == GAME_PAUSED) {
+            draw_pause_menu(memory_dc);
+        }
+
         StretchDIBits(device_context, 
                       0, 0, g_window_width, g_window_height, 
                       0, 0, g_render_width, g_render_height, 
                       g_framebuffer_memory, &g_framebuffer_info, 
                       DIB_RGB_COLORS, SRCCOPY);
+        
+        SelectObject(memory_dc, old_bitmap);
+        DeleteDC(memory_dc);
         ReleaseDC(g_window_handle, device_context);
     }
     return 0;
@@ -417,49 +583,53 @@ static int ray_intersects_triangle(vec3_t ro, vec3_t rv, vec3_t v0, vec3_t v1, v
     vec3_t e1 = vec3_sub(v1, v0);
     vec3_t e2 = vec3_sub(v2, v0);
     
-    vec3_t face_normal = vec3_cross(e1, e2);
+    vec3_t face_normal = vec3_normalize(vec3_cross(e1, e2));
 
-    // The original Möller–Trumbore test's 'a' value is effectively this dot product.
-    // We check it directly to determine if we're hitting a backface.
-    float backface_check = vec3_dot(rv, face_normal);
-
-    // If using strict backface culling for physics (not recommended)
-    // if (backface_check >= 0) return 0;
+    // This check is for rays parallel to the triangle plane.
+    float n_dot_rv = vec3_dot(face_normal, rv);
+    if (fabs(n_dot_rv) < EPS) {
+        return 0; // Ray is parallel, no intersection.
+    }
 
     vec3_t h = vec3_cross(rv, e2);
     float a = vec3_dot(e1, h);
 
-    // This check is for rays parallel to the triangle plane.
+    // This check is for rays that are nearly parallel inside the triangle plane.
     if (a > -EPS && a < EPS) return 0;
 
     float f = 1.f / a;
     vec3_t s = vec3_sub(ro, v0);
     float u = f * vec3_dot(s, h);
     if (u < 0.f || u > 1.f) return 0;
+
     vec3_t q = vec3_cross(s, e1);
     float v = f * vec3_dot(rv, q);
     if (v < 0.f || u + v > 1.f) return 0;
+    
     float t = f * vec3_dot(e2, q);
     if (t > EPS) {
         if (d) *d = t;
         if (normal) {
-            // --- NEW LOGIC: Ensure normal always faces the ray origin ---
-            if (backface_check > 0) {
-                // Ray is hitting the back of the triangle, so flip the normal for collision response.
-                *normal = vec3_normalize(vec3_scale(face_normal, -1.0f));
+            // If the ray and normal are pointing in the same general direction,
+            // it means we've hit a back-face. We need to flip the collision normal
+            // so we are always pushed "out" of the geometry.
+            if (n_dot_rv > 0) {
+                *normal = vec3_scale(face_normal, -1.0f);
             } else {
-                *normal = vec3_normalize(face_normal);
+                *normal = face_normal;
             }
         }
         return 1;
     }
     return 0;
 }
-static int raycast_scene(vec3_t ray_origin, vec3_t ray_dir, float max_dist, float* hit_dist, vec3_t* hit_normal) {
+static int raycast_scene(vec3_t ray_origin, vec3_t ray_dir, float max_dist, float* hit_dist, vec3_t* hit_normal, int ignore_index) {
     int hit = 0;
     float closest_dist = max_dist;
 
     for (int i = 0; i < g_scene.object_count; i++) {
+        if (i == ignore_index) continue; // <-- THE NEW LINE
+
         scene_object_t* obj = g_scene.objects[i];
         if (!obj->mesh || !obj->has_collision) continue;
 
@@ -516,26 +686,39 @@ static vec3_t find_closest_point_on_line_segment(vec3_t p, vec3_t a, vec3_t b) {
     if (t > 1.0f) t = 1.0f;
     return vec3_add(a, vec3_scale(ab, t));
 }
-
 static vec3_t find_closest_point_on_triangle(vec3_t p, vec3_t a, vec3_t b, vec3_t c) {
     vec3_t ab = vec3_sub(b, a);
     vec3_t ac = vec3_sub(c, a);
     vec3_t normal = vec3_cross(ab, ac);
+    float normal_len_sq = vec3_length_sq(normal);
 
     // Project p onto the triangle's plane
-    vec3_t closest_point = vec3_sub(p, vec3_scale(normal, vec3_dot(vec3_sub(p, a), normal) / vec3_dot(normal, normal)));
+    vec3_t closest_point = (normal_len_sq > 1e-9f)
+        ? vec3_sub(p, vec3_scale(normal, vec3_dot(vec3_sub(p, a), normal) / normal_len_sq))
+        : a; // Fallback for degenerate (line/point) triangle
 
     // Check if the projected point is inside the triangle using barycentric coordinates
     float u, v, w;
     vec3_t v0 = vec3_sub(b, a), v1 = vec3_sub(c, a), v2 = vec3_sub(closest_point, a);
-    float d00 = vec3_dot(v0, v0), d01 = vec3_dot(v0, v1), d11 = vec3_dot(v1, v1);
+    float d00 = vec3_length_sq(v0), d01 = vec3_dot(v0, v1), d11 = vec3_length_sq(v1);
     float d20 = vec3_dot(v2, v0), d21 = vec3_dot(v2, v1);
     float denom = d00 * d11 - d01 * d01;
+
+    // If triangle is degenerate, find closest point on its longest edge
+    if (fabs(denom) < 1e-9f) {
+        float ab_sq = vec3_length_sq(vec3_sub(b,a));
+        float bc_sq = vec3_length_sq(vec3_sub(c,b));
+        float ca_sq = vec3_length_sq(vec3_sub(a,c));
+        if (ab_sq >= bc_sq && ab_sq >= ca_sq) return find_closest_point_on_line_segment(p, a, b);
+        if (bc_sq >= ca_sq) return find_closest_point_on_line_segment(p, b, c);
+        return find_closest_point_on_line_segment(p, c, a);
+    }
+    
     v = (d11 * d20 - d01 * d21) / denom;
     w = (d00 * d21 - d01 * d20) / denom;
     u = 1.0f - v - w;
 
-    if (u >= 0 && v >= 0 && w >= 0) {
+    if (u >= 0.0f && v >= 0.0f && w >= 0.0f) {
         return closest_point; // The closest point is on the face of the triangle
     }
 
@@ -544,32 +727,36 @@ static vec3_t find_closest_point_on_triangle(vec3_t p, vec3_t a, vec3_t b, vec3_
     vec3_t p_bc = find_closest_point_on_line_segment(p, b, c);
     vec3_t p_ca = find_closest_point_on_line_segment(p, c, a);
 
-    float d_ab = vec3_dot(vec3_sub(p, p_ab), vec3_sub(p, p_ab));
-    float d_bc = vec3_dot(vec3_sub(p, p_bc), vec3_sub(p, p_bc));
-    float d_ca = vec3_dot(vec3_sub(p, p_ca), vec3_sub(p, p_ca));
+    float d_ab_sq = vec3_length_sq(vec3_sub(p, p_ab));
+    float d_bc_sq = vec3_length_sq(vec3_sub(p, p_bc));
+    float d_ca_sq = vec3_length_sq(vec3_sub(p, p_ca));
 
-    if (d_ab <= d_bc && d_ab <= d_ca) {
+    if (d_ab_sq <= d_bc_sq && d_ab_sq <= d_ca_sq) {
         return p_ab;
-    } else if (d_bc <= d_ab && d_bc <= d_ca) {
+    } else if (d_bc_sq <= d_ab_sq && d_bc_sq <= d_ca_sq) {
         return p_bc;
     } else {
         return p_ca;
     }
 }
-static vec3_t resolve_sphere_collision(vec3_t pos, float radius) {
-    vec3_t final_pos = pos;
+static int check_sphere_world_collision(vec3_t pos, float radius, vec3_t* out_normal, float* out_depth, int ignore_index) {
+    int collided = 0;
+    float max_penetration = 0.0f;
+
     for (int i = 0; i < g_scene.object_count; i++) {
+        if (i == ignore_index) continue; // <-- ADD THIS CHECK
+        
         scene_object_t* obj = g_scene.objects[i];
         if (!obj->mesh || !obj->has_collision) continue;
 
         mat4_t model_matrix = mat4_get_world_transform(&g_scene, i);
         mat4_t inv_model_matrix = mat4_inverse(model_matrix);
 
-        // Transform sphere center into object's local space
-        vec4_t sphere_center_local_4 = mat4_mul_vec4(inv_model_matrix, (vec4_t){final_pos.x, final_pos.y, final_pos.z, 1.0f});
+        vec4_t sphere_center_local_4 = mat4_mul_vec4(inv_model_matrix, (vec4_t){pos.x, pos.y, pos.z, 1.0f});
         vec3_t sphere_center_local = {sphere_center_local_4.x, sphere_center_local_4.y, sphere_center_local_4.z};
-
-        float scaled_radius = radius / fmax(obj->scale.x, fmax(obj->scale.y, obj->scale.z));
+        
+        float max_scale = fmax(obj->scale.x, fmax(obj->scale.y, obj->scale.z));
+        float scaled_radius = radius / max_scale;
         float scaled_radius_sq = scaled_radius * scaled_radius;
 
         for (int j = 0; j < obj->mesh->face_count; j++) {
@@ -581,37 +768,75 @@ static vec3_t resolve_sphere_collision(vec3_t pos, float radius) {
             vec3_t v1 = obj->mesh->vertices[v1i];
             vec3_t v2 = obj->mesh->vertices[v2i];
 
-            // Find the closest point on the triangle (face, edges, or vertices) to our sphere
             vec3_t closest_point_local = find_closest_point_on_triangle(sphere_center_local, v0, v1, v2);
 
             vec3_t delta = vec3_sub(sphere_center_local, closest_point_local);
             float dist_sq = vec3_dot(delta, delta);
 
-            // If the distance is less than the radius, we have a collision
             if (dist_sq < scaled_radius_sq) {
                 float dist = sqrtf(dist_sq);
                 float penetration = scaled_radius - dist;
-                vec3_t push_dir_local = (dist > 1e-6) ? vec3_scale(delta, 1.0f / dist) : vec3_normalize(vec3_sub(v1,v0));
 
-                // Transform the push vector back into world space
-                vec4_t push_dir_world_4 = mat4_mul_vec4(model_matrix, (vec4_t){push_dir_local.x, push_dir_local.y, push_dir_local.z, 0.0f});
-                vec3_t push_dir_world = vec3_normalize((vec3_t){push_dir_world_4.x, push_dir_world_4.y, push_dir_world_4.z});
-                
-                // Push the final position out of the collision
-                final_pos = vec3_add(final_pos, vec3_scale(push_dir_world, penetration));
+                if (penetration > max_penetration) {
+                    collided = 1;
+                    max_penetration = penetration;
 
-                // Re-transform the updated position back into local space for the next iteration
-                sphere_center_local_4 = mat4_mul_vec4(inv_model_matrix, (vec4_t){final_pos.x, final_pos.y, final_pos.z, 1.0f});
-                sphere_center_local = (vec3_t){sphere_center_local_4.x, sphere_center_local_4.y, sphere_center_local_4.z};
+                    vec3_t normal_local = (dist > 1e-6) ? vec3_scale(delta, 1.0f / dist) : vec3_normalize(vec3_cross(vec3_sub(v1,v0), vec3_sub(v2,v0)));
+                    
+                    vec4_t normal_world_4 = mat4_mul_vec4(model_matrix, (vec4_t){normal_local.x, normal_local.y, normal_local.z, 0.0f});
+                    *out_normal = vec3_normalize((vec3_t){normal_world_4.x, normal_world_4.y, normal_world_4.z});
+                    
+                    *out_depth = penetration * max_scale;
+                }
             }
         }
     }
-    return final_pos;
+    return collided;
+}
+static vec3_t collide_and_slide(vec3_t pos, vec3_t vel, float radius, int ignore_index, int* out_on_ground) {
+    const int MAX_SLIDES = 4;
+    const float BOUNCE_FACTOR = 0.1f; 
+
+    // Initialize to not on ground at the start of the movement
+    *out_on_ground = 0;
+
+    for (int slide = 0; slide < MAX_SLIDES; slide++) {
+        vec3_t destination = vec3_add(pos, vel);
+
+        vec3_t collision_normal;
+        float penetration_depth;
+        if (!check_sphere_world_collision(destination, radius, &collision_normal, &penetration_depth, ignore_index)) {
+            // No collision on this path, return the final destination
+            return destination; 
+        }
+
+        // A collision occurred, adjust position to be just outside the surface
+        pos = vec3_add(pos, vec3_scale(collision_normal, penetration_depth));
+        
+        // If the collision was with a walkable surface, set the ground flag.
+        // We check if the normal is pointing mostly upwards.
+        if (collision_normal.z > 0.7f) {
+            *out_on_ground = 1;
+        }
+
+        // Project the velocity onto the collision plane to get the "slide" vector
+        float dot_product = vec3_dot(vel, collision_normal);
+        vec3_t slide_vel = vec3_sub(vel, vec3_scale(collision_normal, dot_product));
+        
+        // Add a small bounce to prevent getting stuck in crevices
+        vec3_t bounce_vel = vec3_scale(collision_normal, -dot_product * BOUNCE_FACTOR);
+
+        // The new velocity for the next iteration is the slide plus the bounce
+        vel = vec3_add(slide_vel, bounce_vel);
+    }
+
+    // If we finished all slide iterations, it means we're likely stuck. Return the last safe position.
+    return pos;
 }
 void update_player(float dt) {
-    if (!g_player_active) return;
+    if (!g_player_active || g_game_state == GAME_PAUSED) return;
 
-    // --- MOUSE LOOK AND TAB LOGIC (This is unchanged) ---
+    // --- MOUSE LOOK AND TAB LOGIC (Unchanged) ---
     int is_tab_down = (GetKeyState(VK_TAB) & 0x8000) != 0;
     if (is_tab_down != g_mouse_is_free) {
         g_mouse_is_free = is_tab_down;
@@ -632,8 +857,8 @@ void update_player(float dt) {
             float dy = (float)(p.y - center_y);
 
             if (dx != 0 || dy != 0) {
-                g_player_yaw -= dx * 0.0015f;
-                g_player_pitch -= dy * 0.0015f;
+                g_player_yaw -= dx * g_player_config.mouse_sensitivity;
+                g_player_pitch -= dy * g_player_config.mouse_sensitivity;
 
                 if (g_player_pitch > 1.5f) g_player_pitch = 1.5f;
                 if (g_player_pitch < -1.5f) g_player_pitch = -1.5f;
@@ -645,82 +870,113 @@ void update_player(float dt) {
         }
     }
     
-    // --- 1. HORIZONTAL MOVEMENT (X & Y) ---
-    vec3_t move_input = {0};
-    if (GetKeyState('W') & 0x8000) move_input.x += 1.0f;
-    if (GetKeyState('S') & 0x8000) move_input.x -= 1.0f;
-    if (GetKeyState('A') & 0x8000) move_input.y -= 1.0f;
-    if (GetKeyState('D') & 0x8000) move_input.y += 1.0f;
+    // --- 1. CALCULATE MOVEMENT INTENT (WISH DIRECTION) ---
+    vec3_t wish_dir = {0};
+    if (GetKeyState('W') & 0x8000) wish_dir.x += 1.0f;
+    if (GetKeyState('S') & 0x8000) wish_dir.x -= 1.0f;
+    if (GetKeyState('A') & 0x8000) wish_dir.y -= 1.0f;
+    if (GetKeyState('D') & 0x8000) wish_dir.y += 1.0f;
 
     vec3_t forward_dir = {cosf(g_player_yaw), sinf(g_player_yaw), 0};
     vec3_t right_dir   = {sinf(g_player_yaw), -cosf(g_player_yaw), 0};
-    vec3_t wish_dir = vec3_normalize(vec3_add(vec3_scale(forward_dir, move_input.x), vec3_scale(right_dir, move_input.y)));
+    wish_dir = vec3_normalize(vec3_add(vec3_scale(forward_dir, wish_dir.x), vec3_scale(right_dir, wish_dir.y)));
     
-    g_player_velocity.x = wish_dir.x * PLAYER_SPEED;
-    g_player_velocity.y = wish_dir.y * PLAYER_SPEED;
-
-    g_player_position.x += g_player_velocity.x * dt;
-    g_player_position.y += g_player_velocity.y * dt;
-
-    // Resolve horizontal collisions by checking the capsule (two spheres)
-    vec3_t bottom_sphere_pos = g_player_position;
-    bottom_sphere_pos.z += PLAYER_RADIUS;
-    vec3_t top_sphere_pos = g_player_position;
-    top_sphere_pos.z += PLAYER_HEIGHT - PLAYER_RADIUS;
+    // --- 2. UPDATE VELOCITY BASED ON STATE (GROUNDED VS AIR) ---
+    vec3_t horizontal_vel = { g_player_velocity.x, g_player_velocity.y, 0 };
     
-    vec3_t resolved_bottom = resolve_sphere_collision(bottom_sphere_pos, PLAYER_RADIUS);
-    vec3_t resolved_top = resolve_sphere_collision(top_sphere_pos, PLAYER_RADIUS);
+    if (g_player_on_ground) {
+        // --- Ground Movement ---
+        float current_speed = vec3_dot(horizontal_vel, wish_dir);
+        float add_speed = PLAYER_SPEED - current_speed;
+        if (add_speed > 0) {
+            float accel_speed = PLAYER_ACCELERATION * dt;
+            if (accel_speed > add_speed) {
+                accel_speed = add_speed;
+            }
+            g_player_velocity.x += wish_dir.x * accel_speed;
+            g_player_velocity.y += wish_dir.y * accel_speed;
+        }
 
-    // Apply the largest push-out correction from either sphere
-    float push_out_bottom = vec3_length(vec3_sub(resolved_bottom, bottom_sphere_pos));
-    float push_out_top = vec3_length(vec3_sub(resolved_top, top_sphere_pos));
+        // Apply friction
+        float speed = vec3_length(horizontal_vel);
+        if (speed > 0) {
+            float friction_drop = speed * PLAYER_FRICTION * dt;
+            float new_speed = speed - friction_drop;
+            if (new_speed < 0) new_speed = 0;
+            if (speed > 0) {
+                g_player_velocity.x *= (new_speed / speed);
+                g_player_velocity.y *= (new_speed / speed);
+            }
+        }
 
-    if (push_out_bottom > push_out_top) {
-        g_player_position.x += resolved_bottom.x - bottom_sphere_pos.x;
-        g_player_position.y += resolved_bottom.y - bottom_sphere_pos.y;
+        // Handle jumping
+        if ((GetKeyState(VK_SPACE) & 0x8000)) {
+            g_player_velocity.z = PLAYER_JUMP_FORCE;
+            g_player_on_ground = 0;
+        }
     } else {
-        g_player_position.x += resolved_top.x - top_sphere_pos.x;
-        g_player_position.y += resolved_top.y - top_sphere_pos.y;
+        // --- Air Movement ---
+        float current_speed = vec3_dot(horizontal_vel, wish_dir);
+        float add_speed = PLAYER_SPEED - current_speed;
+        if (add_speed > 0) {
+            float accel_speed = PLAYER_AIR_ACCELERATION * dt;
+            if (accel_speed > add_speed) {
+                accel_speed = add_speed;
+            }
+            g_player_velocity.x += wish_dir.x * accel_speed;
+            g_player_velocity.y += wish_dir.y * accel_speed;
+        }
     }
 
-    // --- 2. VERTICAL MOVEMENT (Z) ---
-    if ((GetKeyState(VK_SPACE) & 0x8000) && g_player_on_ground) {
-        g_player_velocity.z = PLAYER_JUMP_FORCE;
-        g_player_on_ground = 0;
-    }
-
+    // --- 3. APPLY GRAVITY (ONLY WHEN IN THE AIR) ---
     if (!g_player_on_ground) {
         g_player_velocity.z += PLAYER_GRAVITY * dt;
     }
-    
-    g_player_position.z += g_player_velocity.z * dt;
-    
-    // Reset ground state before checking
-    g_player_on_ground = 0;
 
-    // Check for ground collision (bottom sphere)
-    bottom_sphere_pos = g_player_position;
+    // --- 4. COLLIDE AND SLIDE FOR THE ENTIRE CAPSULE ---
+    vec3_t move_delta = vec3_scale(g_player_velocity, dt);
+
+    vec3_t bottom_sphere_pos = g_player_position;
     bottom_sphere_pos.z += PLAYER_RADIUS;
-    resolved_bottom = resolve_sphere_collision(bottom_sphere_pos, PLAYER_RADIUS);
-
-    if (resolved_bottom.z > bottom_sphere_pos.z) { // We were pushed UP
-        g_player_position.z += resolved_bottom.z - bottom_sphere_pos.z; // Snap to ground
-        if (g_player_velocity.z < 0) { // Only stop falling if we were moving down
-            g_player_velocity.z = 0;
-            g_player_on_ground = 1;
-        }
-    }
     
-    // Check for ceiling collision (top sphere)
-    top_sphere_pos = g_player_position;
+    vec3_t top_sphere_pos = g_player_position;
     top_sphere_pos.z += PLAYER_HEIGHT - PLAYER_RADIUS;
-    resolved_top = resolve_sphere_collision(top_sphere_pos, PLAYER_RADIUS);
+
+    int grounded_this_frame = 0;
+    int bottom_is_grounded = 0;
+    int top_is_grounded = 0;
+
+    vec3_t resolved_bottom_pos = collide_and_slide(bottom_sphere_pos, move_delta, PLAYER_RADIUS, g_player_model_index, &bottom_is_grounded);
+    vec3_t resolved_top_pos = collide_and_slide(top_sphere_pos, move_delta, PLAYER_RADIUS, g_player_model_index, &top_is_grounded);
     
-    if (resolved_top.z < top_sphere_pos.z) { // We were pushed DOWN
-        g_player_position.z += resolved_top.z - top_sphere_pos.z; // Snap to ceiling
-        if (g_player_velocity.z > 0) { // Stop rising if we hit our head
-            g_player_velocity.z = 0;
-        }
+    grounded_this_frame = bottom_is_grounded || top_is_grounded;
+
+    vec3_t final_pos;
+    vec3_t final_displacement_bottom = vec3_sub(resolved_bottom_pos, bottom_sphere_pos);
+    vec3_t final_displacement_top = vec3_sub(resolved_top_pos, top_sphere_pos);
+    
+    if (vec3_length_sq(final_displacement_bottom) > vec3_length_sq(final_displacement_top)) {
+         final_pos = vec3_sub(resolved_bottom_pos, (vec3_t){0, 0, PLAYER_RADIUS});
+    } else {
+         final_pos = vec3_sub(resolved_top_pos, (vec3_t){0, 0, PLAYER_HEIGHT - PLAYER_RADIUS});
+    }
+
+
+    // --- 5. UPDATE FINAL POSITION AND VELOCITY ---
+    // If there was no significant movement, we can avoid calculating velocity
+    // from position, which can introduce floating point errors.
+    if (vec3_length_sq(move_delta) > 1e-12) {
+        vec3_t actual_velocity = vec3_scale(vec3_sub(final_pos, g_player_position), 1.0f / dt);
+        g_player_velocity = actual_velocity;
+    } else {
+        g_player_velocity = (vec3_t){0,0,0};
+    }
+    g_player_position = final_pos;
+
+    // --- 6. UPDATE GROUNDED STATE ---
+    g_player_on_ground = grounded_this_frame;
+    if (g_player_on_ground && g_player_velocity.z < 0) {
+        g_player_velocity.z = 0; // Stop downward velocity when we land
     }
 }
 void render_frame() {
@@ -736,27 +992,22 @@ void render_frame() {
     mat4_t view_matrix;
 
     if (g_player_active) {
-        // --- NEW LOGIC for 3rd Person Camera ---
         if (g_player_model_index != -1) {
             scene_object_t* player_model = g_scene.objects[g_player_model_index];
 
-            // Update the model's position and rotation to match the player controller
             player_model->position = g_player_position;
-            player_model->rotation.z = g_player_yaw; // Sync Yaw with player look direction
+            player_model->rotation.z = g_player_yaw; 
 
-            // Calculate the world-space position of the camera target
             mat4_t player_transform = mat4_get_world_transform(&g_scene, g_player_model_index);
             vec4_t target_local = {player_model->camera_offset.x, player_model->camera_offset.y, player_model->camera_offset.z, 1.0f};
             vec4_t target_world_4 = mat4_mul_vec4(player_transform, target_local);
             vec3_t camera_target = {target_world_4.x, target_world_4.y, target_world_4.z};
 
-            // Calculate camera position based on distance and orientation from the target
             vec3_t offset;
             offset.x = g_camera_distance * cosf(g_player_pitch) * cosf(g_player_yaw);
             offset.y = g_camera_distance * cosf(g_player_pitch) * sinf(g_player_yaw);
             offset.z = g_camera_distance * sinf(g_player_pitch);
             
-            // The camera position is offset from the *target*, not the player origin
             camera_pos = vec3_add(camera_target, vec3_scale(offset, -1.0f));
             
             vec3_t up_vector = {0, 0, 1};
@@ -765,7 +1016,7 @@ void render_frame() {
             }
             view_matrix = mat4_look_at(camera_pos, camera_target, up_vector);
 
-        } else { // --- FALLBACK to 1st Person if no model is set ---
+        } else { 
             vec3_t eye_pos = g_player_position;
             eye_pos.z += PLAYER_EYE_HEIGHT;
             camera_pos = eye_pos;
@@ -785,7 +1036,7 @@ void render_frame() {
             view_matrix = mat4_look_at(eye_pos, camera_target, up_vector);
         }
 
-    } else { // Fallback orbital camera if player is not active
+    } else { 
         vec3_t offset;
         offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
         offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
@@ -799,13 +1050,15 @@ void render_frame() {
         view_matrix = mat4_look_at(camera_pos, g_camera_target, up_vector);
     }
     
-    mat4_t projection_matrix = mat4_perspective(3.14159f / 2.0f, (float)g_render_width / (float)g_render_height, 0.1f, 100.0f);
+    float fov_radians = g_player_config.fov_degrees * (3.14159f / 180.0f);
+    mat4_t projection_matrix = mat4_perspective(fov_radians, (float)g_render_width / (float)g_render_height, 0.1f, 100.0f);
     
-    // --- MODIFIED RENDER LOOP ---
     for (int i = 0; i < g_scene.object_count; i++) {
-        // Don't render the spawn point or the player model itself
-        if (g_scene.objects[i]->is_player_spawn || i == g_player_model_index) {
+        if (g_scene.objects[i]->is_player_spawn) {
             continue;
+        }
+        if (i == g_player_model_index && g_camera_distance < 1.0f) {
+             continue; // Don't render player model if camera is too close
         }
         render_object(g_scene.objects[i], i, view_matrix, projection_matrix, camera_pos);
     }
@@ -1168,14 +1421,48 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             scene_destroy(&g_scene);
             if (g_clip_coords_buffer) free(g_clip_coords_buffer);
             if (g_colors_buffer) free(g_colors_buffer);
-            if (g_depth_buffer) free(g_depth_buffer); // Free depth buffer on exit
-            // g_framebuffer_memory is freed by DeleteObject on the HBITMAP
+            if (g_depth_buffer) free(g_depth_buffer);
             PostQuitMessage(0);
         } break;
         case WM_SIZE: {
-            // --- MODIFIED: Only update window dimensions. Don't touch the framebuffer. ---
             g_window_width = LOWORD(l_param); 
             g_window_height = HIWORD(l_param);
+        } break;
+        case WM_LBUTTONDOWN: {
+            if (g_game_state == GAME_PAUSED) {
+                int mouse_x = LOWORD(l_param);
+                int mouse_y = HIWORD(l_param);
+
+                float scaled_mx = (float)mouse_x * ((float)g_render_width / (float)g_window_width);
+                float scaled_my = (float)mouse_y * ((float)g_render_height / (float)g_window_height);
+                POINT pt = { (int)scaled_mx, (int)scaled_my };
+
+                if (PtInRect(&g_resume_button_rect, pt)) {
+                    g_game_state = GAME_RUNNING;
+                    ShowCursor(FALSE);
+                    g_mouse_is_free = 0;
+                    POINT screen_center = {g_window_width / 2, g_window_height / 2};
+                    ClientToScreen(g_window_handle, &screen_center);
+                    SetCursorPos(screen_center.x, screen_center.y);
+                } else if (PtInRect(&g_exit_button_rect, pt)) {
+                    PostQuitMessage(0);
+                } else if (PtInRect(&g_fov_minus_rect, pt)) {
+                    g_player_config.fov_degrees -= 5.0f;
+                    if (g_player_config.fov_degrees < 40.0f) g_player_config.fov_degrees = 40.0f;
+                    save_config(&g_player_config);
+                } else if (PtInRect(&g_fov_plus_rect, pt)) {
+                    g_player_config.fov_degrees += 5.0f;
+                    if (g_player_config.fov_degrees > 120.0f) g_player_config.fov_degrees = 120.0f;
+                    save_config(&g_player_config);
+                } else if (PtInRect(&g_sens_minus_rect, pt)) {
+                    g_player_config.mouse_sensitivity -= 0.0005f;
+                    if (g_player_config.mouse_sensitivity < 0.0005f) g_player_config.mouse_sensitivity = 0.0005f;
+                    save_config(&g_player_config);
+                } else if (PtInRect(&g_sens_plus_rect, pt)) {
+                    g_player_config.mouse_sensitivity += 0.0005f;
+                    save_config(&g_player_config);
+                }
+            }
         } break;
         case WM_MBUTTONDOWN: {
             g_middle_mouse_down = 1;
@@ -1188,15 +1475,16 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
             ReleaseCapture();
         } break;
         case WM_MOUSEWHEEL: {
-            int delta = GET_WHEEL_DELTA_WPARAM(w_param);
-            if (delta > 0) g_camera_distance -= 0.5f; else g_camera_distance += 0.5f;
-            if (g_camera_distance < 2.0f) g_camera_distance = 2.0f;
-            if (g_camera_distance > 40.0f) g_camera_distance = 40.0f;
+            if (g_game_state == GAME_RUNNING) {
+                int delta = GET_WHEEL_DELTA_WPARAM(w_param);
+                if (delta > 0) g_camera_distance -= 0.5f; else g_camera_distance += 0.5f;
+                if (g_camera_distance < 0.5f) g_camera_distance = 0.5f; // Allow getting closer
+                if (g_camera_distance > 40.0f) g_camera_distance = 40.0f;
+            }
         } break;
         case WM_MOUSEMOVE: {
             int cur_x = LOWORD(l_param), cur_y = HIWORD(l_param);
             int dx = cur_x - g_last_mouse_x, dy = cur_y - g_last_mouse_y;
-            // This orbital camera logic is only a fallback if player is not active
             if (!g_player_active && g_middle_mouse_down) {
                  if (GetKeyState(VK_SHIFT) & 0x8000) {
                     float sens = 0.0025f * g_camera_distance;
@@ -1221,7 +1509,18 @@ LRESULT CALLBACK window_callback(HWND window_handle, UINT message, WPARAM w_para
         } break;
         case WM_KEYDOWN: {
             if (w_param == VK_ESCAPE) {
-                PostQuitMessage(0);
+                if (g_game_state == GAME_RUNNING) {
+                    g_game_state = GAME_PAUSED;
+                    g_mouse_is_free = 1;
+                    ShowCursor(TRUE);
+                } else {
+                    g_game_state = GAME_RUNNING;
+                    g_mouse_is_free = 0;
+                    ShowCursor(FALSE);
+                    POINT screen_center = {g_window_width / 2, g_window_height / 2};
+                    ClientToScreen(g_window_handle, &screen_center);
+                    SetCursorPos(screen_center.x, screen_center.y);
+                }
             }
         } break;
         default: {

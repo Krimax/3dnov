@@ -71,6 +71,7 @@ vec3_t vec3_normalize(vec3_t v);
 vec3_t vec3_add(vec3_t a, vec3_t b);
 vec3_t vec3_scale(vec3_t v, float s);
 float vec3_length(vec3_t v);
+float vec3_length_sq(vec3_t v);
 // --- Matrix Functions ---
 mat4_t mat4_identity(void);
 mat4_t mat4_perspective(float fov_y, float aspect_ratio, float near_plane, float far_plane);

@@ -70,13 +70,15 @@ mat4_t mat4_rotation_z(float angle_rad) {
 }
 
 
-// --- NEW Vector Functions ---
+// ---  Vector Functions ---
 
 vec3_t vec3_sub(vec3_t a, vec3_t b) {
     vec3_t result = { a.x - b.x, a.y - b.y, a.z - b.z };
     return result;
 }
-
+float vec3_length_sq(vec3_t v) {
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}
 vec3_t vec3_cross(vec3_t a, vec3_t b) {
     vec3_t result = {
         a.y * b.z - a.z * b.y,

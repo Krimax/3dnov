@@ -536,12 +536,13 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
     char header[4];
     fread(header, sizeof(char), 4, file);
 
+    int is_scn4_format = (strncmp(header, "SCN4", 4) == 0);
     int is_scn3_format = (strncmp(header, "SCN3", 4) == 0);
     int is_scn2_format = (strncmp(header, "SCN2", 4) == 0);
     int is_scn1_format = (strncmp(header, "SCN1", 4) == 0);
 
     int object_count = 0;
-    if (is_scn3_format || is_scn2_format) {
+    if (is_scn4_format || is_scn3_format || is_scn2_format) {
         fread(&g_sky_color, sizeof(vec3_t), 1, file);
         fread(&object_count, sizeof(int), 1, file);
     } else if (is_scn1_format) {
@@ -569,11 +570,17 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         new_obj->child_capacity = 4;
         new_obj->children = (int*)malloc(new_obj->child_capacity * sizeof(int));
         
+        if (is_scn4_format) {
+            fread(new_obj->name, sizeof(char), 64, file);
+        } else {
+            sprintf_s(new_obj->name, sizeof(new_obj->name), "LoadedObject.%03d", i);
+        }
+
         fread(&new_obj->position, sizeof(vec3_t), 1, file);
         fread(&new_obj->rotation, sizeof(vec3_t), 1, file);
         fread(&new_obj->scale, sizeof(vec3_t), 1, file);
         
-        if (is_scn3_format || is_scn2_format) {
+        if (is_scn4_format || is_scn3_format || is_scn2_format) {
             fread(&new_obj->material, sizeof(material_t), 1, file);
         } else if (is_scn1_format) {
             vec3_t old_color;
@@ -587,7 +594,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
             new_obj->material.shininess = 32.0f;
         }
         
-        if (is_scn3_format) {
+        if (is_scn4_format || is_scn3_format) {
              fread(&new_obj->parent_index, sizeof(int), 1, file);
              fread(&new_obj->is_double_sided, sizeof(int), 1, file);
              fread(&new_obj->is_static, sizeof(int), 1, file);
@@ -608,7 +615,7 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
              fread(&new_obj->is_double_sided, sizeof(int), 1, file);
              fread(&new_obj->is_static, sizeof(int), 1, file);
              new_obj->is_player_spawn = 0;
-             new_obj->has_collision = 1; // <-- SET DEFAULT
+             new_obj->has_collision = 1;
              new_obj->is_player_model = 0;
              new_obj->camera_offset = (vec3_t){0,0,0};
         } else {
@@ -616,14 +623,14 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
              new_obj->is_double_sided = 0;
              new_obj->is_static = 0;
              new_obj->is_player_spawn = 0;
-             new_obj->has_collision = 1; // <-- SET DEFAULT
+             new_obj->has_collision = 1;
              new_obj->is_player_model = 0;
              new_obj->camera_offset = (vec3_t){0,0,0};
         }
 
 
         int is_light = 0;
-        if (is_scn3_format || is_scn2_format || is_scn1_format) {
+        if (is_scn4_format || is_scn3_format || is_scn2_format || is_scn1_format) {
             fread(&is_light, sizeof(int), 1, file);
         }
 
@@ -651,7 +658,6 @@ int scene_load_from_file(scene_t* scene, const char* filename) {
         scene->objects[scene->object_count++] = new_obj;
     }
 
-    // --- PASS 2: Link children to their parents ---
     for (int i = 0; i < scene->object_count; i++) {
         int parent_idx = scene->objects[i]->parent_index;
         if (parent_idx != -1 && parent_idx < scene->object_count) {
@@ -857,7 +863,7 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         return;
     }
 
-    char header[4] = "SCN3"; // NEW FORMAT
+    char header[4] = "SCN4"; // NEW FORMAT with names
     fwrite(header, sizeof(char), 4, file);
     fwrite(&g_sky_color, sizeof(vec3_t), 1, file);
     fwrite(&scene->object_count, sizeof(int), 1, file);
@@ -865,6 +871,7 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
     for (int i = 0; i < scene->object_count; i++) {
         scene_object_t* obj = scene->objects[i];
 
+        fwrite(obj->name, sizeof(char), 64, file);
         fwrite(&obj->position, sizeof(vec3_t), 1, file);
         fwrite(&obj->rotation, sizeof(vec3_t), 1, file);
         fwrite(&obj->scale, sizeof(vec3_t), 1, file);
@@ -876,8 +883,8 @@ void scene_save_to_file(scene_t* scene, const char* filename) {
         fwrite(&obj->is_static, sizeof(int), 1, file);
         fwrite(&obj->is_player_spawn, sizeof(int), 1, file);
         fwrite(&obj->has_collision, sizeof(int), 1, file);
-        fwrite(&obj->is_player_model, sizeof(int), 1, file); // <-- NEW
-        fwrite(&obj->camera_offset, sizeof(vec3_t), 1, file); // <-- NEW
+        fwrite(&obj->is_player_model, sizeof(int), 1, file);
+        fwrite(&obj->camera_offset, sizeof(vec3_t), 1, file);
 
 
         int is_light = (obj->light_properties != NULL);
@@ -3156,13 +3163,11 @@ case WM_LBUTTONDOWN: {
             int mouse_x = LOWORD(l_param);
             int mouse_y = HIWORD(l_param);
             
-            // --- NEW: Scale mouse coordinates to render space for UI interaction ---
             float scaled_mx = (float)mouse_x * ((float)g_render_width / (float)g_window_width);
             float scaled_my = (float)mouse_y * ((float)g_render_height / (float)g_window_height);
             POINT pt = {(int)scaled_mx, (int)scaled_my};
 
             if (g_hEdit) {
-                // Edit box logic still uses screen coordinates, so this is an exception
                 RECT edit_rect;
                 GetWindowRect(g_hEdit, &edit_rect);
                 POINT screen_pt = {mouse_x, mouse_y};
@@ -3174,7 +3179,6 @@ case WM_LBUTTONDOWN: {
                 }
             }
 
-            // --- MODIFIED: Use scaled point for all PtInRect checks ---
             for (int i = 0; i < 2; i++) {
                 if (PtInRect(&g_mode_rects[i], pt)) {
                     editor_mode_t new_mode = (editor_mode_t)i;
@@ -3254,16 +3258,15 @@ case WM_LBUTTONDOWN: {
                 return 0;
             }
             
-            // Coordinate/Material text editing is omitted for brevity but should also use scaled 'pt'
-            
             if (g_current_tool == TOOL_SELECT) {
                 g_mouse_down = 1;
                 g_mouse_dragged = 0;
                 g_last_mouse_x = mouse_x;
                 g_last_mouse_y = mouse_y;
                 SetCapture(window_handle);
+
                 int outliner_panel_x = g_render_width - 210;
-                if (scaled_mx >= outliner_panel_x) { // Check scaled coordinate
+                if (scaled_mx >= outliner_panel_x) {
                     int is_shift_down = GetKeyState(VK_SHIFT) & 0x8000;
                     int clicked_outliner_object = -1;
                     for (int i = 0; i < g_scene.object_count; i++) { if (PtInRect(&g_scene.objects[i]->ui_outliner_rect, pt)) { clicked_outliner_object = i; break; } }
@@ -3275,17 +3278,17 @@ case WM_LBUTTONDOWN: {
                             if (was_already_selected && g_selected_objects.count == 1) { selection_clear(&g_selected_objects); selection_clear(&g_selected_components); } else { selection_clear(&g_selected_objects); selection_clear(&g_selected_components); selection_add(&g_selected_objects, clicked_outliner_object); }
                         }
                     }
-                    g_is_box_selecting = 0;
+                    g_is_box_selecting = 0; // Don't allow box selection to start over the outliner
                     return 0;
                 }
-                // Pass original mouse_x, mouse_y as the picking functions now handle scaling internally
-                int clicked_object = find_clicked_object(mouse_x, mouse_y);
-                if (clicked_object == -1) {
-                    g_is_box_selecting = 1;
-                    // MODIFIED: Use scaled coordinates for selection box
-                    g_selection_box_rect.left = (int)scaled_mx; g_selection_box_rect.top = (int)scaled_my;
-                    g_selection_box_rect.right = (int)scaled_mx; g_selection_box_rect.bottom = (int)scaled_my;
-                }
+                
+                // We no longer check for a clicked object here.
+                // Instead, we optimistically start a box selection. The LBUTTONUP event
+                // will determine if it was a real drag or just a single click.
+                g_is_box_selecting = 1;
+                g_selection_box_rect.left = (int)scaled_mx; g_selection_box_rect.top = (int)scaled_my;
+                g_selection_box_rect.right = (int)scaled_mx; g_selection_box_rect.bottom = (int)scaled_my;
+
             } else if (g_current_tool == TOOL_DRAW_FACE) {
                 g_mouse_down = 1;
                 g_mouse_dragged = 0;
@@ -3307,7 +3310,6 @@ case WM_LBUTTONUP: {
             int mouse_y = HIWORD(l_param);
             int is_shift_down = GetKeyState(VK_SHIFT) & 0x8000;
             
-            // --- NEW: Scale mouse coordinates to render space for UI interaction ---
             float scaled_mx = (float)mouse_x * ((float)g_render_width / (float)g_window_width);
             float scaled_my = (float)mouse_y * ((float)g_render_height / (float)g_window_height);
 
@@ -3326,95 +3328,106 @@ case WM_LBUTTONUP: {
                     g_transform_initial_vertices = NULL;
                 }
             }
-            else if (g_is_box_selecting) {
-                g_is_box_selecting = 0;
-                // Update selection rect with final scaled coordinates before normalizing
-                g_selection_box_rect.right = (int)scaled_mx;
-                g_selection_box_rect.bottom = (int)scaled_my;
-                normalize_rect(&g_selection_box_rect);
+            else if (g_mouse_down) { 
+                if (g_mouse_dragged && g_is_box_selecting) {
+                    g_selection_box_rect.right = (int)scaled_mx;
+                    g_selection_box_rect.bottom = (int)scaled_my;
+                    normalize_rect(&g_selection_box_rect);
 
-                if (!is_shift_down) {
-                    selection_clear(&g_selected_objects);
-                    selection_clear(&g_selected_components);
-                }
-                
-                if (g_current_mode == MODE_OBJECT) {
-                    for (int i = 0; i < g_scene.object_count; i++) {
-                        scene_object_t* obj = g_scene.objects[i];
-                        mat4_t world_matrix = mat4_get_world_transform(&g_scene, i);
-                        vec3_t p = {world_matrix.m[0][3], world_matrix.m[1][3], world_matrix.m[2][3]};
+                    if (!is_shift_down) {
+                        selection_clear(&g_selected_objects);
+                        selection_clear(&g_selected_components);
+                    }
+                    
+                    if (g_current_mode == MODE_OBJECT) {
+                        for (int i = 0; i < g_scene.object_count; i++) {
+                            scene_object_t* obj = g_scene.objects[i];
+                            mat4_t world_matrix = mat4_get_world_transform(&g_scene, i);
+                            vec3_t p = {world_matrix.m[0][3], world_matrix.m[1][3], world_matrix.m[2][3]};
 
+                            vec3_t offset;
+                            offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
+                            offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
+                            offset.z = g_camera_distance * sinf(g_camera_pitch);
+                            vec3_t cam_pos=vec3_add(g_camera_target, offset);
+                            vec3_t up_vec = {0,0,1}; if (fabs(sinf(g_camera_pitch)) > 0.999f) up_vec = (vec3_t){0, 1, 0};
+                            mat4_t view = mat4_look_at(cam_pos, g_camera_target, up_vec);
+                            mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_render_width/(float)g_render_height, 0.1f, 100.0f);
+                            mat4_t final = mat4_mul_mat4(proj, view);
+                            vec4_t clip = mat4_mul_vec4(final, (vec4_t){p.x, p.y, p.z, 1.0f});
+                            if (clip.w > 0) {
+                                float sx = (clip.x/clip.w+1)*0.5f*g_render_width;
+                                float sy = (1-clip.y/clip.w)*0.5f*g_render_height;
+                                POINT pt = {(LONG)sx, (LONG)sy};
+                                if (PtInRect(&g_selection_box_rect, pt)) {
+                                    selection_add(&g_selected_objects, i);
+                                }
+                            }
+                        }
+                    } else if (g_current_mode == MODE_EDIT && g_selected_objects.count > 0) {
+                        int obj_idx = g_selected_objects.items[0];
+                        scene_object_t* object = g_scene.objects[obj_idx];
+                        mat4_t model_matrix = mat4_get_world_transform(&g_scene, obj_idx);
+                        
                         vec3_t offset;
                         offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
                         offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
                         offset.z = g_camera_distance * sinf(g_camera_pitch);
                         vec3_t cam_pos=vec3_add(g_camera_target, offset);
-                        mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,0,1});
+                        vec3_t up_vec = {0,0,1}; if (fabs(sinf(g_camera_pitch)) > 0.999f) up_vec = (vec3_t){0, 1, 0};
+                        mat4_t view = mat4_look_at(cam_pos, g_camera_target, up_vec);
                         mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_render_width/(float)g_render_height, 0.1f, 100.0f);
-                        mat4_t final = mat4_mul_mat4(proj, view);
-                        vec4_t clip = mat4_mul_vec4(final, (vec4_t){p.x, p.y, p.z, 1.0f});
-                        if (clip.w > 0) {
-                            float sx = (clip.x/clip.w+1)*0.5f*g_render_width;
-                            float sy = (1-clip.y/clip.w)*0.5f*g_render_height;
-                            POINT pt = {(LONG)sx, (LONG)sy};
-                            if (PtInRect(&g_selection_box_rect, pt)) {
-                                selection_add(&g_selected_objects, i);
+                        mat4_t final = mat4_mul_mat4(proj, mat4_mul_mat4(view, model_matrix));
+                        
+                        if (g_edit_mode_component == EDIT_VERTICES) {
+                            for (int i = 0; i < object->mesh->vertex_count; i++) {
+                                 vec4_t clip = mat4_mul_vec4(final, (vec4_t){object->mesh->vertices[i].x, object->mesh->vertices[i].y, object->mesh->vertices[i].z, 1.0f});
+                                 if (clip.w > 0) {
+                                    float sx = (clip.x/clip.w+1)*0.5f*g_render_width;
+                                    float sy = (1-clip.y/clip.w)*0.5f*g_render_height;
+                                    POINT pt = {(LONG)sx, (LONG)sy};
+                                    if (PtInRect(&g_selection_box_rect, pt)) {
+                                        selection_add(&g_selected_components, i);
+                                    }
+                                 }
                             }
                         }
                     }
-                } else if (g_current_mode == MODE_EDIT && g_selected_objects.count > 0) {
-                    int obj_idx = g_selected_objects.items[0];
-                    scene_object_t* object = g_scene.objects[obj_idx];
-                    mat4_t model_matrix = mat4_get_world_transform(&g_scene, obj_idx);
+                } else {
+                    int clicked_obj_idx = find_clicked_object(mouse_x, mouse_y);
                     
-                    vec3_t offset;
-                    offset.x = g_camera_distance * cosf(g_camera_pitch) * cosf(g_camera_yaw);
-                    offset.y = g_camera_distance * cosf(g_camera_pitch) * sinf(g_camera_yaw);
-                    offset.z = g_camera_distance * sinf(g_camera_pitch);
-                    vec3_t cam_pos=vec3_add(g_camera_target, offset);
-                    mat4_t view = mat4_look_at(cam_pos, g_camera_target, (vec3_t){0,0,1});
-                    mat4_t proj = mat4_perspective(3.14159f/4.0f, (float)g_render_width/(float)g_render_height, 0.1f, 100.0f);
-                    mat4_t final = mat4_mul_mat4(proj, mat4_mul_mat4(view, model_matrix));
+                    if (!is_shift_down) {
+                        selection_clear(&g_selected_objects);
+                        selection_clear(&g_selected_components);
+                    }
                     
-                    if (g_edit_mode_component == EDIT_VERTICES) {
-                        for (int i = 0; i < object->mesh->vertex_count; i++) {
-                             vec4_t clip = mat4_mul_vec4(final, (vec4_t){object->mesh->vertices[i].x, object->mesh->vertices[i].y, object->mesh->vertices[i].z, 1.0f});
-                             if (clip.w > 0) {
-                                float sx = (clip.x/clip.w+1)*0.5f*g_render_width;
-                                float sy = (1-clip.y/clip.w)*0.5f*g_render_height;
-                                POINT pt = {(LONG)sx, (LONG)sy};
-                                if (PtInRect(&g_selection_box_rect, pt)) {
-                                    selection_add(&g_selected_components, i);
+                    if (clicked_obj_idx != -1) {
+                        if (is_shift_down && selection_contains(&g_selected_objects, clicked_obj_idx)) {
+                             selection_remove(&g_selected_objects, clicked_obj_idx);
+                        } else {
+                             selection_add(&g_selected_objects, clicked_obj_idx);
+                        }
+                        
+                        if (g_current_mode == MODE_EDIT) {
+                            scene_object_t* obj = g_scene.objects[clicked_obj_idx];
+                            int clicked_comp_idx = -1;
+                            switch(g_edit_mode_component) {
+                                case EDIT_FACES:    clicked_comp_idx = find_clicked_face(obj, clicked_obj_idx, mouse_x, mouse_y); break;
+                                case EDIT_VERTICES: clicked_comp_idx = find_clicked_vertex(obj, clicked_obj_idx, mouse_x, mouse_y); break;
+                                case EDIT_EDGES:    clicked_comp_idx = find_clicked_edge(obj, clicked_obj_idx, mouse_x, mouse_y); break;
+                            }
+                            if (clicked_comp_idx != -1) {
+                               if (is_shift_down && selection_contains(&g_selected_components, clicked_comp_idx)) {
+                                    selection_remove(&g_selected_components, clicked_comp_idx);
+                                } else {
+                                    selection_add(&g_selected_components, clicked_comp_idx);
                                 }
-                             }
+                            }
                         }
                     }
                 }
             }
-            else if (!g_mouse_dragged) {
-                if (!is_shift_down) {
-                    selection_clear(&g_selected_objects);
-                    selection_clear(&g_selected_components);
-                }
-                
-                int clicked_obj_idx = find_clicked_object(mouse_x, mouse_y);
-                if (clicked_obj_idx != -1) {
-                    selection_add(&g_selected_objects, clicked_obj_idx);
-                    
-                    if (g_current_mode == MODE_EDIT) {
-                        scene_object_t* obj = g_scene.objects[clicked_obj_idx];
-                        int clicked_comp_idx = -1;
-                        switch(g_edit_mode_component) {
-                            case EDIT_FACES:    clicked_comp_idx = find_clicked_face(obj, clicked_obj_idx, mouse_x, mouse_y); break;
-                            case EDIT_VERTICES: clicked_comp_idx = find_clicked_vertex(obj, clicked_obj_idx, mouse_x, mouse_y); break;
-                            case EDIT_EDGES:    clicked_comp_idx = find_clicked_edge(obj, clicked_obj_idx, mouse_x, mouse_y); break;
-                        }
-                        if (clicked_comp_idx != -1) {
-                           selection_add(&g_selected_components, clicked_comp_idx);
-                        }
-                    }
-                }
-            }
+            g_is_box_selecting = 0;
             g_mouse_down = 0;
             ReleaseCapture();
         } break;
@@ -3738,7 +3751,6 @@ case WM_COMMAND: {
             }
             else if (g_is_box_selecting) {
                 g_mouse_dragged = 1;
-                // --- MODIFIED: Scale current mouse position to render space ---
                 float scaled_mx = (float)cur_x * ((float)g_render_width / (float)g_window_width);
                 float scaled_my = (float)cur_y * ((float)g_render_height / (float)g_window_height);
                 g_selection_box_rect.right = (int)scaled_mx;
